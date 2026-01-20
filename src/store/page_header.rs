@@ -21,6 +21,12 @@ pub enum PageType {
     StateRoot = 4,
     /// Storage fanout page.
     StorageFanout = 5,
+    /// MPT Branch node with 16 children.
+    MptBranch = 6,
+    /// MPT Extension node with shared path.
+    MptExtension = 7,
+    /// MPT Leaf node with value.
+    MptLeaf = 8,
 }
 
 impl PageType {
@@ -32,6 +38,9 @@ impl PageType {
             3 => Some(PageType::Abandoned),
             4 => Some(PageType::StateRoot),
             5 => Some(PageType::StorageFanout),
+            6 => Some(PageType::MptBranch),
+            7 => Some(PageType::MptExtension),
+            8 => Some(PageType::MptLeaf),
             _ => None,
         }
     }

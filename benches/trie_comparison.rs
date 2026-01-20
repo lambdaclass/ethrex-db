@@ -6,15 +6,15 @@
 //!
 //! Run with: cargo bench --bench trie_comparison
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 // ethrex_db
-use ethrex_db::merkle::{MerkleTrie, keccak256};
+use ethrex_db::merkle::{keccak256, MerkleTrie};
 
 // ethrex-trie
-use ethrex_trie::{Trie as EthrexTrie, TrieError, Nibbles};
+use ethrex_trie::{Nibbles, Trie as EthrexTrie, TrieError};
 
 // cita_trie
 use cita_trie::{MemoryDB, PatriciaTrie, Trie as CitaTrie};
@@ -99,7 +99,7 @@ fn bench_insert(c: &mut Criterion) {
                     for (key, value) in data {
                         let _ = trie.insert(key.to_vec(), value.clone());
                     }
-                    trie.hash()
+                    trie.hash_no_commit()
                 })
             },
         );
@@ -170,32 +170,30 @@ fn bench_get(c: &mut Criterion) {
 fn bench_root_hash(c: &mut Criterion) {
     let mut group = c.benchmark_group("Trie Root Hash");
 
-    for size in [100, 1000].iter() {
+    for size in [20_000].iter() {
         let test_data = generate_test_data(*size);
 
-        // Setup tries (inserts included, measuring hash computation)
-        let mut ethrex_db_trie = MerkleTrie::new();
-        for (key, value) in &test_data {
-            ethrex_db_trie.insert(key, value.clone());
-        }
+        group.bench_with_input(BenchmarkId::new("ethrex_db", size), &(), |b, _| {
+            b.iter(|| {
+                let mut ethrex_db_trie = MerkleTrie::new();
+                for (key, value) in &test_data {
+                    ethrex_db_trie.insert(key, value.clone());
+                }
 
-        let db = InMemoryTrieDB::default();
-        let mut ethrex_trie = EthrexTrie::new(Box::new(db));
-        for (key, value) in &test_data {
-            let _ = ethrex_trie.insert(key.to_vec(), value.clone());
-        }
+                ethrex_db_trie.root_hash()
+            })
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("ethrex_db", size),
-            &(),
-            |b, _| b.iter(|| ethrex_db_trie.root_hash()),
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("ethrex_trie", size),
-            &(),
-            |b, _| b.iter(|| ethrex_trie.hash()),
-        );
+        group.bench_with_input(BenchmarkId::new("ethrex_trie", size), &(), |b, _| {
+            b.iter(|| {
+                let db = InMemoryTrieDB::default();
+                let mut ethrex_trie = EthrexTrie::new(Box::new(db));
+                for (key, value) in &test_data {
+                    let _ = ethrex_trie.insert(key.to_vec(), value.clone());
+                }
+                ethrex_trie.hash_no_commit()
+            })
+        });
     }
 
     group.finish();

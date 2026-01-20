@@ -59,9 +59,11 @@ pub struct Blockchain {
 
 /// Converts chain Account to trie AccountData.
 fn account_to_data(account: &Account) -> AccountData {
+    let mut balance = [0u8; 32];
+    account.balance.to_big_endian(&mut balance);
     AccountData {
         nonce: account.nonce,
-        balance: account.balance.to_big_endian(),
+        balance,
         storage_root: *account.storage_root.as_fixed_bytes(),
         code_hash: *account.code_hash.as_fixed_bytes(),
     }
@@ -364,7 +366,8 @@ impl Blockchain {
                         let slot: [u8; 32] = *key.as_fixed_bytes();
 
                         // U256 values need to be converted
-                        let val = value.to_big_endian();
+                        let mut val = [0u8; 32];
+                        value.to_big_endian(&mut val);
 
                         storage.set(&slot, val);
                     }
