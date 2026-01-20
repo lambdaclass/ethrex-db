@@ -20,9 +20,12 @@ use std::path::Path;
 use hashbrown::HashMap;
 use rustc_hash::FxBuildHasher;
 
-use super::paged_db::{PagedDb, DbError, BatchContext};
-use super::page_types::{LeafPage, DataPage, BUCKET_COUNT};
-use super::{DbAddress, Page, PageHeader, PageType, PAGE_SIZE};
+use super::paged_db::{PagedDb, DbError, BatchContext, CommitOptions};
+use super::page_types::{LeafPage, DataPage};
+use super::{DbAddress, PageType};
+
+/// Default initial size for in-memory stores (1024 pages = 4MB).
+const DEFAULT_IN_MEMORY_PAGES: u32 = 1024;
 use super::subtree_cache::SubtreeHashCache;
 
 /// Type alias for fast HashMap with FxHash.
@@ -66,14 +69,19 @@ impl PagedFlatStore {
     }
 
     /// Creates a new in-memory paged flat store.
-    pub fn in_memory() -> Self {
-        Self {
-            db: PagedDb::in_memory(),
+    pub fn in_memory() -> Result<Self, DbError> {
+        Self::in_memory_with_size(DEFAULT_IN_MEMORY_PAGES)
+    }
+
+    /// Creates a new in-memory paged flat store with specified page count.
+    pub fn in_memory_with_size(pages: u32) -> Result<Self, DbError> {
+        Ok(Self {
+            db: PagedDb::in_memory(pages)?,
             write_buffer: FastHashMap::with_hasher(FxBuildHasher),
             bucket_root: DbAddress::NULL,
             dirty_buckets: vec![false; 65536],
             bucket_cache: FastHashMap::with_hasher(FxBuildHasher),
-        }
+        })
     }
 
     /// Gets a value by key.
@@ -115,7 +123,7 @@ impl PagedFlatStore {
         let low = (bucket & 0xFF) as usize;
 
         // Read top-level index page
-        let index_page = self.db.read_page(self.bucket_root)?;
+        let index_page = self.db.get_page(self.bucket_root).ok()?;
         let data_page = DataPage::wrap(index_page);
 
         // Get second-level index address
@@ -125,7 +133,7 @@ impl PagedFlatStore {
         }
 
         // Read second-level index page
-        let second_page = self.db.read_page(second_addr)?;
+        let second_page = self.db.get_page(second_addr).ok()?;
         let second_data = DataPage::wrap(second_page);
 
         let bucket_addr = second_data.get_bucket(low);
@@ -138,7 +146,7 @@ impl PagedFlatStore {
 
     /// Searches a bucket page for a specific key.
     fn search_bucket_for_key(&self, bucket_addr: DbAddress, key: &[u8; 32]) -> Option<Vec<u8>> {
-        let page = self.db.read_page(bucket_addr)?;
+        let page = self.db.get_page(bucket_addr).ok()?;
         let leaf = LeafPage::wrap(page);
 
         // Linear search through the bucket (could be optimized with binary search)
@@ -221,11 +229,18 @@ impl PagedFlatStore {
         let mut batch = self.db.begin_batch();
 
         for (bucket, changes) in buckets {
-            self.apply_bucket_changes(&mut batch, bucket, changes)?;
+            // Get or create bucket page
+            let bucket_addr = Self::ensure_bucket_page(
+                &mut self.bucket_root,
+                &mut self.bucket_cache,
+                &mut batch,
+                bucket,
+            )?;
+            Self::apply_bucket_changes(bucket_addr, &mut batch, changes)?;
         }
 
         // Commit the batch
-        self.db.commit_batch(batch)?;
+        batch.commit(CommitOptions::FlushDataAndRoot)?;
 
         // Clear dirty tracking
         self.dirty_buckets.fill(false);
@@ -234,20 +249,18 @@ impl PagedFlatStore {
     }
 
     /// Applies changes to a single bucket.
+    ///
+    /// Note: Uses batch.get_page() to avoid borrow conflicts with self.db
     fn apply_bucket_changes(
-        &mut self,
+        bucket_addr: DbAddress,
         batch: &mut BatchContext,
-        bucket: u16,
         changes: Vec<([u8; 32], Option<Vec<u8>>)>,
     ) -> Result<(), DbError> {
-        // Get or create bucket page
-        let bucket_addr = self.ensure_bucket_page(batch, bucket)?;
-
-        // Read existing entries
+        // Read existing entries using batch (which can access db internally)
         let mut entries: FastHashMap<[u8; 32], Vec<u8>> =
             FastHashMap::with_hasher(FxBuildHasher);
 
-        if let Some(page) = self.db.read_page(bucket_addr) {
+        if let Ok(page) = batch.get_page(bucket_addr) {
             let leaf = LeafPage::wrap(page);
             let data = leaf.data();
             let mut offset = 0;
@@ -303,33 +316,41 @@ impl PagedFlatStore {
         }
 
         // Write the page
-        batch.write_page(bucket_addr, leaf.into_page());
+        batch.mark_dirty(bucket_addr, leaf.into_page());
 
         Ok(())
     }
 
     /// Ensures a bucket page exists, creating it if necessary.
-    fn ensure_bucket_page(&mut self, batch: &mut BatchContext, bucket: u16) -> Result<DbAddress, DbError> {
+    ///
+    /// Note: Uses batch.get_page() to avoid borrow conflicts with self.db
+    fn ensure_bucket_page(
+        bucket_root: &mut DbAddress,
+        bucket_cache: &mut FastHashMap<u16, DbAddress>,
+        batch: &mut BatchContext,
+        bucket: u16,
+    ) -> Result<DbAddress, DbError> {
         // Check cache
-        if let Some(&addr) = self.bucket_cache.get(&bucket) {
+        if let Some(&addr) = bucket_cache.get(&bucket) {
             if !addr.is_null() {
                 return Ok(addr);
             }
         }
 
         // Ensure bucket index exists
-        if self.bucket_root.is_null() {
-            self.bucket_root = batch.allocate_page();
-            let index_page = DataPage::new(batch.batch_id(), 0);
-            batch.write_page(self.bucket_root, index_page.into_page());
+        if bucket_root.is_null() {
+            let (addr, page) = batch.allocate_page(PageType::Data, 0)?;
+            *bucket_root = addr;
+            let index_page = DataPage::wrap(page);
+            batch.mark_dirty(*bucket_root, index_page.into_page());
         }
 
         let high = (bucket >> 8) as usize;
         let low = (bucket & 0xFF) as usize;
 
-        // Ensure top-level index page exists
-        let index_page = self.db.read_page(self.bucket_root)
-            .unwrap_or_else(|| {
+        // Ensure top-level index page exists (use batch.get_page to avoid borrow conflict)
+        let index_page = batch.get_page(*bucket_root)
+            .unwrap_or_else(|_| {
                 let p = DataPage::new(batch.batch_id(), 0);
                 p.into_page()
             });
@@ -338,17 +359,17 @@ impl PagedFlatStore {
         // Ensure second-level index exists
         let mut second_addr = data_page.get_bucket(high);
         if second_addr.is_null() {
-            second_addr = batch.allocate_page();
-            let second_page = DataPage::new(batch.batch_id(), 1);
-            batch.write_page(second_addr, second_page.into_page());
+            let (addr, page) = batch.allocate_page(PageType::Data, 1)?;
+            second_addr = addr;
+            batch.mark_dirty(second_addr, page);
 
             data_page.set_bucket(high, second_addr);
-            batch.write_page(self.bucket_root, data_page.into_page());
+            batch.mark_dirty(*bucket_root, data_page.into_page());
         }
 
         // Ensure bucket page exists
-        let second_page = self.db.read_page(second_addr)
-            .unwrap_or_else(|| {
+        let second_page = batch.get_page(second_addr)
+            .unwrap_or_else(|_| {
                 let p = DataPage::new(batch.batch_id(), 1);
                 p.into_page()
             });
@@ -356,16 +377,16 @@ impl PagedFlatStore {
 
         let mut bucket_addr = second_data.get_bucket(low);
         if bucket_addr.is_null() {
-            bucket_addr = batch.allocate_page();
-            let leaf_page = LeafPage::new(batch.batch_id(), 2);
-            batch.write_page(bucket_addr, leaf_page.into_page());
+            let (addr, page) = batch.allocate_page(PageType::Leaf, 2)?;
+            bucket_addr = addr;
+            batch.mark_dirty(bucket_addr, page);
 
             second_data.set_bucket(low, bucket_addr);
-            batch.write_page(second_addr, second_data.into_page());
+            batch.mark_dirty(second_addr, second_data.into_page());
         }
 
         // Update cache
-        self.bucket_cache.insert(bucket, bucket_addr);
+        bucket_cache.insert(bucket, bucket_addr);
 
         Ok(bucket_addr)
     }
@@ -384,17 +405,8 @@ impl PagedFlatStore {
         let mut entries = Vec::new();
 
         for &bucket in buckets {
+            // entries_in_bucket already applies buffered changes
             entries.extend(self.entries_in_bucket(bucket));
-        }
-
-        // Include buffered entries for these buckets
-        for (key, value) in &self.write_buffer {
-            let bucket = SubtreeHashCache::key_to_bucket(key);
-            if buckets.contains(&bucket) {
-                if let Some(v) = value {
-                    entries.push((*key, v.clone()));
-                }
-            }
         }
 
         entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -407,7 +419,7 @@ impl PagedFlatStore {
 
         // Get from disk
         if let Some(bucket_addr) = self.get_bucket_addr(bucket) {
-            if let Some(page) = self.db.read_page(bucket_addr) {
+            if let Ok(page) = self.db.get_page(bucket_addr) {
                 let leaf = LeafPage::wrap(page);
                 let data = leaf.data();
                 let mut offset = 0;
@@ -539,7 +551,7 @@ mod tests {
 
     #[test]
     fn test_in_memory_basic() {
-        let mut store = PagedFlatStore::in_memory();
+        let mut store = PagedFlatStore::in_memory().unwrap();
 
         let key = keccak256(b"test_key");
         let value = b"test_value".to_vec();
@@ -550,7 +562,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut store = PagedFlatStore::in_memory();
+        let mut store = PagedFlatStore::in_memory().unwrap();
 
         let key = keccak256(b"test_key");
         let value = b"test_value".to_vec();
@@ -564,7 +576,7 @@ mod tests {
 
     #[test]
     fn test_sorted_entries_in_buckets() {
-        let mut store = PagedFlatStore::in_memory();
+        let mut store = PagedFlatStore::in_memory().unwrap();
 
         // Insert entries into different buckets
         for i in 0..100u32 {
@@ -588,7 +600,7 @@ mod tests {
 
     #[test]
     fn test_dirty_tracking() {
-        let mut store = PagedFlatStore::in_memory();
+        let mut store = PagedFlatStore::in_memory().unwrap();
 
         assert!(!store.has_dirty());
 

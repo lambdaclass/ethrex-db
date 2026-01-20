@@ -41,12 +41,9 @@
 use hashbrown::HashMap;
 use rustc_hash::FxBuildHasher;
 
-use crate::merkle::{keccak256, EMPTY_ROOT, HASH_SIZE};
+use crate::merkle::{keccak256, MerkleTrie, EMPTY_ROOT, HASH_SIZE};
 
-#[cfg(test)]
-use crate::merkle::MerkleTrie;
 use super::flat_store::{FlatAccountStore, FlatStorageStore};
-use super::stack_trie::StackTrie;
 use super::subtree_cache::SubtreeHashCache;
 use super::trie_store::AccountData;
 
@@ -290,7 +287,10 @@ impl SparseStateTrie {
         }
     }
 
-    /// Computes the storage root for an account using streaming StackTrie.
+    /// Computes the storage root for an account using MerkleTrie.
+    ///
+    /// Note: This currently uses MerkleTrie. Once StackTrie bugs are fixed,
+    /// this should be updated to use streaming StackTrie for O(depth) memory.
     fn compute_storage_root_streaming(&self, address_hash: &[u8; 32]) -> [u8; HASH_SIZE] {
         let entries = self.storage.sorted_entries_for_account(address_hash);
 
@@ -298,8 +298,12 @@ impl SparseStateTrie {
             return EMPTY_ROOT;
         }
 
-        // Use streaming StackTrie for O(depth) memory
-        StackTrie::build_from_sorted_iter(entries.into_iter())
+        // Use MerkleTrie (TODO: switch to StackTrie once bugs are fixed)
+        let mut trie = MerkleTrie::new();
+        for (key, value) in entries {
+            trie.insert(&key, value);
+        }
+        trie.root_hash()
     }
 
     /// Computes the state root using streaming StackTrie.
@@ -334,9 +338,12 @@ impl SparseStateTrie {
         }
     }
 
-    /// Full recomputation using streaming StackTrie.
+    /// Full recomputation using MerkleTrie.
     ///
     /// Used when most buckets are dirty or on first computation.
+    ///
+    /// Note: This currently uses MerkleTrie. Once StackTrie bugs are fixed,
+    /// this should be updated to use streaming StackTrie for O(depth) memory.
     fn compute_state_root_full_streaming(&mut self) -> [u8; HASH_SIZE] {
         // Get all entries sorted
         let entries = self.accounts.sorted_entries();
@@ -345,49 +352,33 @@ impl SparseStateTrie {
             return EMPTY_ROOT;
         }
 
-        // Build root using streaming StackTrie
-        let root = StackTrie::build_from_sorted_iter(entries.into_iter());
+        // Build root using MerkleTrie (TODO: switch to StackTrie once bugs are fixed)
+        let mut trie = MerkleTrie::new();
+        for (key, value) in entries {
+            trie.insert(&key, value);
+        }
+        let root = trie.root_hash();
 
-        // Update cache for all buckets (mark all as clean)
+        // Mark all buckets as clean
         self.account_cache.clear_dirty();
-
-        // TODO: In a full implementation, we would compute and store
-        // subtree hashes for each bucket during the StackTrie pass.
-        // For now, we just clear the dirty flags.
 
         root
     }
 
     /// Incremental computation using cached subtree hashes.
     ///
-    /// Only recomputes dirty buckets, using cached hashes for clean ones.
-    /// This is the key optimization for block processing.
+    /// Currently falls back to full recomputation. Future optimization will:
+    /// - Only load entries from dirty buckets
+    /// - Use cached subtree hashes for clean buckets
+    /// - Achieve O(dirty_buckets) instead of O(N)
+    ///
+    /// The infrastructure for bucket-level caching is in place, but correctly
+    /// computing depth-4 subtree hashes requires modifications to StackTrie
+    /// to track bucket boundaries during the streaming pass.
     fn compute_state_root_incremental_streaming(&mut self) -> [u8; HASH_SIZE] {
-        // Collect dirty bucket indices
-        let dirty_buckets: Vec<u16> = self.account_cache.dirty_iter().collect();
-
-        // Get entries ONLY from dirty buckets
-        let entries = self.accounts.sorted_entries_in_buckets(&dirty_buckets);
-
-        if entries.is_empty() && dirty_buckets.is_empty() {
-            // Nothing changed, use cached root
-            return self.cached_root.unwrap_or(EMPTY_ROOT);
-        }
-
-        // For now, fall back to full computation
-        // A full incremental implementation would merge cached subtree hashes
-        // with newly computed dirty bucket hashes.
-        //
-        // The StackTrie::build_with_cached_subtrees method supports this:
-        // ```
-        // let cached_subtrees = self.account_cache.clean_non_empty_iter()
-        //     .map(|bucket| (bucket, self.account_cache.get_hash(bucket).unwrap()));
-        // let root = StackTrie::build_with_cached_subtrees(entries.into_iter(), cached_subtrees);
-        // ```
-        //
-        // However, this requires proper subtree hash computation during the streaming pass,
-        // which is complex to implement correctly. For now, use full recomputation.
-
+        // For now, fall back to full recomputation
+        // The incremental optimization requires computing true depth-4 subtree hashes,
+        // which is complex to implement correctly. See rearchitecture-plan.md for details.
         self.compute_state_root_full_streaming()
     }
 

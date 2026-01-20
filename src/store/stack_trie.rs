@@ -67,15 +67,25 @@ pub struct StackTrie {
     entry_count: usize,
 }
 
+/// Child slot content - either an encoded reference or a pending frame.
+#[derive(Clone, Debug)]
+enum ChildSlot {
+    /// Already encoded (can't be modified).
+    Ref(ChildRef),
+    /// Pending frame (can still be expanded).
+    Pending(Box<StackFrame>),
+}
+
+
 /// A frame on the StackTrie stack representing a node being built.
 #[derive(Clone, Debug)]
 struct StackFrame {
     /// The nibble depth of this frame (0 = root, 64 = leaf).
     depth: usize,
 
-    /// For branch nodes: child references (hash or inline).
+    /// For branch nodes: child slots (encoded or pending).
     /// None = empty slot, Some = child exists.
-    children: Box<[Option<ChildRef>; 16]>,
+    children: Box<[Option<ChildSlot>; 16]>,
 
     /// Value at this node (for branch nodes with values, or leaf value).
     value: Option<Vec<u8>>,
@@ -137,41 +147,81 @@ impl StackFrame {
             });
             encoder.into_bytes()
         } else if !self.extension_path.is_empty() {
-            // Extension node: [encoded_path, child_ref]
-            // Find the single non-empty child
-            let child_ref = self.children.iter()
-                .find_map(|c| c.as_ref())
-                .cloned()
-                .unwrap_or(ChildRef::Empty);
+            // Has extension path - check if this is a true extension (single child)
+            // or a branch with a prefix (multiple children)
+            let child_count = self.children.iter().filter(|c| c.is_some()).count();
+            let has_value = self.value.is_some();
 
-            let mut encoder = RlpEncoder::new();
-            encoder.encode_list(|e| {
-                e.encode_nibbles(&self.extension_path, false);
-                match &child_ref {
-                    ChildRef::Hash(h) => e.encode_bytes(h),
-                    ChildRef::Inline(data) => e.encode_raw(data),
-                    ChildRef::Empty => e.encode_empty(),
-                }
-            });
-            encoder.into_bytes()
+            if child_count <= 1 && !has_value {
+                // True extension node: [encoded_path, child_ref]
+                let child_ref = self.children.iter()
+                    .find_map(|c| c.as_ref())
+                    .map(|slot| match slot {
+                        ChildSlot::Ref(r) => r.clone(),
+                        ChildSlot::Pending(f) => f.to_child_ref(),
+                    })
+                    .unwrap_or(ChildRef::Empty);
+
+                let mut encoder = RlpEncoder::new();
+                encoder.encode_list(|e| {
+                    e.encode_nibbles(&self.extension_path, false);
+                    match &child_ref {
+                        ChildRef::Hash(h) => e.encode_bytes(h),
+                        ChildRef::Inline(data) => e.encode_raw(data),
+                        ChildRef::Empty => e.encode_empty(),
+                    }
+                });
+                encoder.into_bytes()
+            } else {
+                // Branch with prefix: encode as extension -> branch
+                // First encode the branch (without extension path)
+                let branch_encoded = self.encode_as_branch();
+                let branch_ref = ChildRef::from_encoded(branch_encoded);
+
+                // Then wrap in extension
+                let mut encoder = RlpEncoder::new();
+                encoder.encode_list(|e| {
+                    e.encode_nibbles(&self.extension_path, false);
+                    match &branch_ref {
+                        ChildRef::Hash(h) => e.encode_bytes(h),
+                        ChildRef::Inline(data) => e.encode_raw(data),
+                        ChildRef::Empty => e.encode_empty(),
+                    }
+                });
+                encoder.into_bytes()
+            }
         } else {
             // Branch node: [child0, child1, ..., child15, value]
-            let mut encoder = RlpEncoder::new();
-            encoder.encode_list(|e| {
-                for child in self.children.iter() {
-                    match child {
-                        Some(ChildRef::Hash(h)) => e.encode_bytes(h),
-                        Some(ChildRef::Inline(data)) => e.encode_raw(data),
-                        Some(ChildRef::Empty) | None => e.encode_empty(),
+            self.encode_as_branch()
+        }
+    }
+
+    /// Encodes this frame as a branch node (ignoring extension_path).
+    fn encode_as_branch(&self) -> Vec<u8> {
+        let mut encoder = RlpEncoder::new();
+        encoder.encode_list(|e| {
+            for child in self.children.iter() {
+                match child {
+                    Some(ChildSlot::Ref(ChildRef::Hash(h))) => e.encode_bytes(h),
+                    Some(ChildSlot::Ref(ChildRef::Inline(data))) => e.encode_raw(data),
+                    Some(ChildSlot::Ref(ChildRef::Empty)) => e.encode_empty(),
+                    Some(ChildSlot::Pending(frame)) => {
+                        let child_ref = frame.to_child_ref();
+                        match child_ref {
+                            ChildRef::Hash(h) => e.encode_bytes(&h),
+                            ChildRef::Inline(data) => e.encode_raw(&data),
+                            ChildRef::Empty => e.encode_empty(),
+                        }
                     }
-                }
-                match &self.value {
-                    Some(v) => e.encode_bytes(v),
                     None => e.encode_empty(),
                 }
-            });
-            encoder.into_bytes()
-        }
+            }
+            match &self.value {
+                Some(v) => e.encode_bytes(v),
+                None => e.encode_empty(),
+            }
+        });
+        encoder.into_bytes()
     }
 
     /// Computes the child reference (hash or inline) for this node.
@@ -288,7 +338,7 @@ impl StackTrie {
         if self.stack.is_empty() {
             // Create a root branch with this subtree
             let mut frame = StackFrame::branch(0);
-            frame.children[prefix_nibbles[0] as usize] = Some(ChildRef::Hash(hash));
+            frame.children[prefix_nibbles[0] as usize] = Some(ChildSlot::Ref(ChildRef::Hash(hash)));
             self.stack.push(frame);
         } else {
             // Add to existing frame
@@ -298,7 +348,7 @@ impl StackTrie {
             } else {
                 return; // Subtree cache is for depth-4 buckets only
             };
-            frame.children[nibble_idx] = Some(ChildRef::Hash(hash));
+            frame.children[nibble_idx] = Some(ChildSlot::Ref(ChildRef::Hash(hash)));
         }
 
         self.current_prefix = prefix_nibbles.to_vec();
@@ -356,6 +406,11 @@ impl StackTrie {
     fn collapse_to_depth(&mut self, target_depth: usize) {
         // Process frames from top of stack downward
         while let Some(top) = self.stack.last() {
+            // Stop if we only have one frame - can't collapse further
+            if self.stack.len() == 1 {
+                break;
+            }
+
             if top.depth < target_depth {
                 break;
             }
@@ -393,7 +448,7 @@ impl StackTrie {
         // The nibble at parent_depth tells us which slot in parent
         if child_depth > parent_depth && child_depth <= self.current_prefix.len() {
             let nibble_idx = self.current_prefix[parent_depth] as usize;
-            parent.children[nibble_idx] = Some(child_ref);
+            parent.children[nibble_idx] = Some(ChildSlot::Ref(child_ref));
         } else if !frame.is_empty() {
             // Edge case: the frame might be an extension that needs special handling
             let nibble_idx = if parent_depth < self.current_prefix.len() {
@@ -401,7 +456,7 @@ impl StackTrie {
             } else {
                 0
             };
-            parent.children[nibble_idx] = Some(child_ref);
+            parent.children[nibble_idx] = Some(ChildSlot::Ref(child_ref));
         }
     }
 
@@ -442,9 +497,9 @@ impl StackTrie {
                     // Old key ends at branch - set as branch value
                     branch.value = old_leaf.value.clone();
                 } else {
-                    // Old key continues - create leaf child
+                    // Old key continues - create leaf child as Pending (may need expansion later)
                     let old_child = StackFrame::leaf(branch_depth + 1, old_remaining, old_leaf.value.unwrap_or_default());
-                    branch.children[old_nibble] = Some(old_child.to_child_ref());
+                    branch.children[old_nibble] = Some(ChildSlot::Pending(Box::new(old_child)));
                 }
             } else {
                 // Old key ends at branch
@@ -460,9 +515,9 @@ impl StackTrie {
                     // New key ends at branch
                     branch.value = Some(value.to_vec());
                 } else {
-                    // New key continues - create leaf child
+                    // New key continues - create leaf child as Pending (may need expansion later)
                     let new_child = StackFrame::leaf(branch_depth + 1, new_remaining, value.to_vec());
-                    branch.children[new_nibble] = Some(new_child.to_child_ref());
+                    branch.children[new_nibble] = Some(ChildSlot::Pending(Box::new(new_child)));
                 }
             } else {
                 // New key ends at branch
@@ -477,25 +532,81 @@ impl StackTrie {
 
             self.stack.push(branch);
         } else {
-            // Top is a branch - add new entry as child
-            let branch = self.stack.last_mut().unwrap();
-            let _branch_depth = branch.depth;
+            // Top is a branch - check if we need to wrap it or split its extension
+            let branch = self.stack.last().unwrap();
+            let branch_depth = branch.depth;
+            let has_extension = !branch.extension_path.is_empty();
 
-            if diverge_depth < nibbles.len() {
-                let nibble = nibbles[diverge_depth] as usize;
-                let remaining = nibbles[diverge_depth + 1..].to_vec();
+            // If divergence is before the branch's depth, we need to restructure
+            if diverge_depth < branch_depth {
+                // Pop the branch and wrap it
+                let mut old_branch = self.stack.pop().unwrap();
 
-                if remaining.is_empty() {
-                    // Key ends at this branch
-                    branch.value = Some(value.to_vec());
-                } else {
-                    // Create new leaf child
-                    let leaf = StackFrame::leaf(diverge_depth + 1, remaining, value.to_vec());
-                    branch.children[nibble] = Some(leaf.to_child_ref());
+                // Create new branch at divergence point
+                let mut new_branch = StackFrame::branch(diverge_depth);
+
+                // The old branch needs its extension_path adjusted:
+                // The nibble at diverge_depth is now represented by the parent's child slot,
+                // so we only keep the extension from diverge_depth+1 to branch_depth
+                let old_nibble = self.current_prefix[diverge_depth] as usize;
+
+                if has_extension {
+                    // Trim the extension_path: keep only nibbles from diverge_depth+1 to branch_depth
+                    let remaining_path = self.current_prefix[diverge_depth + 1..branch_depth].to_vec();
+                    old_branch.extension_path = remaining_path;
                 }
+                new_branch.children[old_nibble] = Some(ChildSlot::Pending(Box::new(old_branch)));
+
+                // Add new entry as sibling
+                let new_nibble = nibbles[diverge_depth] as usize;
+                let new_remaining = nibbles[diverge_depth + 1..].to_vec();
+
+                if new_remaining.is_empty() {
+                    new_branch.value = Some(value.to_vec());
+                } else {
+                    let new_leaf = StackFrame::leaf(diverge_depth + 1, new_remaining, value.to_vec());
+                    new_branch.children[new_nibble] = Some(ChildSlot::Pending(Box::new(new_leaf)));
+                }
+
+                self.stack.push(new_branch);
             } else {
-                // Key ends at branch
-                branch.value = Some(value.to_vec());
+                // Divergence is at or after the branch depth
+                let branch = self.stack.last_mut().unwrap();
+
+                // Check if there's already a child at the slot we need
+                let nibble = nibbles[branch_depth] as usize;
+
+                if diverge_depth > branch_depth && branch.children[nibble].is_some() {
+                    // The child slot is occupied and divergence is deeper
+                    // We need to recursively expand into the existing child
+                    let old_child_slot = branch.children[nibble].take().unwrap();
+                    let result_slot = Self::expand_child_slot(
+                        old_child_slot,
+                        &self.current_prefix,
+                        nibbles,
+                        value,
+                        branch_depth,
+                        diverge_depth,
+                    );
+                    branch.children[nibble] = Some(result_slot);
+                } else {
+                    // Either no existing child, or divergence is at branch depth - add directly
+                    if branch_depth < nibbles.len() {
+                        let remaining = nibbles[branch_depth + 1..].to_vec();
+
+                        if remaining.is_empty() {
+                            // Key ends at this branch
+                            branch.value = Some(value.to_vec());
+                        } else {
+                            // Create new leaf child as Pending (may need expansion later)
+                            let leaf = StackFrame::leaf(branch_depth + 1, remaining, value.to_vec());
+                            branch.children[nibble] = Some(ChildSlot::Pending(Box::new(leaf)));
+                        }
+                    } else {
+                        // Key ends at branch
+                        branch.value = Some(value.to_vec());
+                    }
+                }
             }
         }
     }
@@ -559,6 +670,136 @@ impl StackTrie {
         }
 
         trie.finalize()
+    }
+
+    /// Recursively expands a child slot to accommodate a new entry at diverge_depth.
+    ///
+    /// This handles the case where we need to expand nested Pending children.
+    fn expand_child_slot(
+        old_slot: ChildSlot,
+        current_prefix: &[u8],
+        new_nibbles: &[u8],
+        new_value: &[u8],
+        parent_depth: usize,
+        diverge_depth: usize,
+    ) -> ChildSlot {
+        match old_slot {
+            ChildSlot::Pending(mut frame) if !frame.is_leaf && frame.depth == diverge_depth => {
+                // The old child is already a branch at diverge_depth - add new entry directly
+                let new_nibble = new_nibbles[diverge_depth] as usize;
+                let new_remaining = new_nibbles[diverge_depth + 1..].to_vec();
+
+                if new_remaining.is_empty() {
+                    frame.value = Some(new_value.to_vec());
+                } else {
+                    let new_leaf = StackFrame::leaf(diverge_depth + 1, new_remaining, new_value.to_vec());
+                    frame.children[new_nibble] = Some(ChildSlot::Pending(Box::new(new_leaf)));
+                }
+                ChildSlot::Pending(frame)
+            }
+            ChildSlot::Pending(mut frame) if !frame.is_leaf && frame.depth < diverge_depth => {
+                // The old child is a branch at a shallower depth - need to recursively expand
+                let child_nibble = current_prefix[frame.depth] as usize;
+
+                if let Some(child_slot) = frame.children[child_nibble].take() {
+                    // Recursively expand the child
+                    let expanded = Self::expand_child_slot(
+                        child_slot,
+                        current_prefix,
+                        new_nibbles,
+                        new_value,
+                        frame.depth,
+                        diverge_depth,
+                    );
+                    frame.children[child_nibble] = Some(expanded);
+                } else {
+                    // No existing child at this slot - create the structure
+                    // This shouldn't normally happen if we're following the prefix correctly
+                    let new_nibble = new_nibbles[diverge_depth] as usize;
+                    let new_remaining = new_nibbles[diverge_depth + 1..].to_vec();
+
+                    if diverge_depth == frame.depth + 1 {
+                        // Add directly to this frame
+                        if new_remaining.is_empty() {
+                            frame.value = Some(new_value.to_vec());
+                        } else {
+                            let new_leaf = StackFrame::leaf(diverge_depth + 1, new_remaining, new_value.to_vec());
+                            frame.children[new_nibble] = Some(ChildSlot::Pending(Box::new(new_leaf)));
+                        }
+                    } else {
+                        // Need to create intermediate structure
+                        let mut sub_branch = StackFrame::branch(diverge_depth);
+                        if new_remaining.is_empty() {
+                            sub_branch.value = Some(new_value.to_vec());
+                        } else {
+                            let new_leaf = StackFrame::leaf(diverge_depth + 1, new_remaining, new_value.to_vec());
+                            sub_branch.children[new_nibble] = Some(ChildSlot::Pending(Box::new(new_leaf)));
+                        }
+                        if diverge_depth > frame.depth + 2 {
+                            sub_branch.extension_path = new_nibbles[frame.depth + 2..diverge_depth].to_vec();
+                        }
+                        frame.children[child_nibble] = Some(ChildSlot::Pending(Box::new(sub_branch)));
+                    }
+                }
+                ChildSlot::Pending(frame)
+            }
+            ChildSlot::Pending(mut frame) => {
+                // Old child is a leaf - need to wrap in a branch
+                let mut sub_branch = StackFrame::branch(diverge_depth);
+
+                // The old child goes at its nibble (from current_prefix)
+                let old_nibble = current_prefix[diverge_depth] as usize;
+
+                // Adjust extension_path since nibbles are now represented by structure
+                let nibbles_consumed = diverge_depth - parent_depth;
+                if frame.extension_path.len() >= nibbles_consumed {
+                    frame.extension_path = frame.extension_path[nibbles_consumed..].to_vec();
+                } else {
+                    frame.extension_path.clear();
+                }
+                sub_branch.children[old_nibble] = Some(ChildSlot::Pending(frame));
+
+                // Add the new entry
+                let new_nibble = new_nibbles[diverge_depth] as usize;
+                let new_remaining = new_nibbles[diverge_depth + 1..].to_vec();
+
+                if new_remaining.is_empty() {
+                    sub_branch.value = Some(new_value.to_vec());
+                } else {
+                    let new_leaf = StackFrame::leaf(diverge_depth + 1, new_remaining, new_value.to_vec());
+                    sub_branch.children[new_nibble] = Some(ChildSlot::Pending(Box::new(new_leaf)));
+                }
+
+                // Add extension path from parent_depth+1 to diverge_depth
+                if diverge_depth > parent_depth + 1 {
+                    sub_branch.extension_path = new_nibbles[parent_depth + 1..diverge_depth].to_vec();
+                }
+
+                ChildSlot::Pending(Box::new(sub_branch))
+            }
+            ChildSlot::Ref(r) => {
+                // Already encoded - can't modify, wrap in new branch
+                let mut sub_branch = StackFrame::branch(diverge_depth);
+                let old_nibble = current_prefix[diverge_depth] as usize;
+                sub_branch.children[old_nibble] = Some(ChildSlot::Ref(r));
+
+                let new_nibble = new_nibbles[diverge_depth] as usize;
+                let new_remaining = new_nibbles[diverge_depth + 1..].to_vec();
+
+                if new_remaining.is_empty() {
+                    sub_branch.value = Some(new_value.to_vec());
+                } else {
+                    let new_leaf = StackFrame::leaf(diverge_depth + 1, new_remaining, new_value.to_vec());
+                    sub_branch.children[new_nibble] = Some(ChildSlot::Pending(Box::new(new_leaf)));
+                }
+
+                if diverge_depth > parent_depth + 1 {
+                    sub_branch.extension_path = new_nibbles[parent_depth + 1..diverge_depth].to_vec();
+                }
+
+                ChildSlot::Pending(Box::new(sub_branch))
+            }
+        }
     }
 }
 
@@ -652,6 +893,107 @@ mod tests {
         let merkle_root = merkle_trie.root_hash();
 
         assert_eq!(stack_root, merkle_root);
+    }
+
+    #[test]
+    fn test_three_entries_wrap_case() {
+        let mut stack_trie = StackTrie::new();
+        let mut merkle_trie = MerkleTrie::new();
+
+        // Three keys: first two share prefix, third diverges at root
+        let key1 = {
+            let mut k = [0u8; 32];
+            k[0] = 0x12; // nibbles: 1,2,3,4,...
+            k[1] = 0x34;
+            k
+        };
+        let key2 = {
+            let mut k = [0u8; 32];
+            k[0] = 0x12; // nibbles: 1,2,5,6,... (shares [1,2])
+            k[1] = 0x56;
+            k
+        };
+        let key3 = {
+            let mut k = [0u8; 32];
+            k[0] = 0x30; // nibbles: 3,0,0,0,... (diverges at nibble 0)
+            k[1] = 0x00;
+            k
+        };
+
+        // Insert in sorted order
+        stack_trie.insert(&key1, b"v1");
+        stack_trie.insert(&key2, b"v2");
+        stack_trie.insert(&key3, b"v3");
+        let stack_root = stack_trie.finalize();
+
+        merkle_trie.insert(&key1, b"v1".to_vec());
+        merkle_trie.insert(&key2, b"v2".to_vec());
+        merkle_trie.insert(&key3, b"v3".to_vec());
+        let merkle_root = merkle_trie.root_hash();
+
+        assert_eq!(stack_root, merkle_root,
+            "StackTrie {:?} != MerkleTrie {:?}",
+            hex::encode(stack_root), hex::encode(merkle_root));
+    }
+
+    #[test]
+    fn test_five_entries_various() {
+        let mut stack_trie = StackTrie::new();
+        let mut merkle_trie = MerkleTrie::new();
+
+        // Five keys with various prefix patterns
+        let keys = [
+            { let mut k = [0u8; 32]; k[0] = 0x11; k[1] = 0x11; k },  // 1,1,1,1,...
+            { let mut k = [0u8; 32]; k[0] = 0x11; k[1] = 0x22; k },  // 1,1,2,2,... (shares [1,1])
+            { let mut k = [0u8; 32]; k[0] = 0x12; k[1] = 0x00; k },  // 1,2,0,0,... (shares [1])
+            { let mut k = [0u8; 32]; k[0] = 0x20; k[1] = 0x00; k },  // 2,0,0,0,...
+            { let mut k = [0u8; 32]; k[0] = 0x30; k[1] = 0x00; k },  // 3,0,0,0,...
+        ];
+
+        for (i, key) in keys.iter().enumerate() {
+            let value = format!("v{}", i);
+            stack_trie.insert(key, value.as_bytes());
+            merkle_trie.insert(key, value.into_bytes());
+        }
+
+        let stack_root = stack_trie.finalize();
+        let merkle_root = merkle_trie.root_hash();
+
+        assert_eq!(stack_root, merkle_root,
+            "StackTrie {:?} != MerkleTrie {:?}",
+            hex::encode(stack_root), hex::encode(merkle_root));
+    }
+
+    #[test]
+    fn test_three_keccak_entries() {
+        let mut stack_trie = StackTrie::new();
+        let mut merkle_trie = MerkleTrie::new();
+
+        // The 3 keccak keys that fail
+        let mut entries: Vec<([u8; 32], Vec<u8>)> = (0..3u32).map(|i| {
+            let key = keccak256(&i.to_le_bytes());
+            let value = format!("v{}", i).into_bytes();
+            (key, value)
+        }).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Print the keys for debugging
+        for (i, (key, _)) in entries.iter().enumerate() {
+            let nibbles: Vec<u8> = key.iter().flat_map(|b| [b >> 4, b & 0x0F]).collect();
+            eprintln!("Key {}: first 8 nibbles = {:?}", i, &nibbles[..8]);
+        }
+
+        for (key, value) in &entries {
+            stack_trie.insert(key, value);
+            merkle_trie.insert(key, value.clone());
+        }
+
+        let stack_root = stack_trie.finalize();
+        let merkle_root = merkle_trie.root_hash();
+
+        assert_eq!(stack_root, merkle_root,
+            "StackTrie {:?} != MerkleTrie {:?}",
+            hex::encode(stack_root), hex::encode(merkle_root));
     }
 
     #[test]
@@ -799,6 +1141,43 @@ mod tests {
         key[0] = 0xAB;
         key[1] = 0xCD;
         assert_eq!(key_to_bucket(&key), 0xABCD);
+    }
+
+    #[test]
+    fn test_incremental_to_find_failure() {
+        for n in 1..=100 {
+            let mut stack_trie = StackTrie::new();
+            let mut merkle_trie = MerkleTrie::new();
+
+            let mut entries: Vec<([u8; 32], Vec<u8>)> = (0..n as u32).map(|i| {
+                let key = keccak256(&i.to_le_bytes());
+                let value = format!("v{}", i).into_bytes();
+                (key, value)
+            }).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+            for (key, value) in &entries {
+                stack_trie.insert(key, value);
+                merkle_trie.insert(key, value.clone());
+            }
+
+            let stack_root = stack_trie.finalize();
+            let merkle_root = merkle_trie.root_hash();
+
+            if stack_root != merkle_root {
+                eprintln!("FAILURE at n={}", n);
+                eprintln!("Stack root: {:?}", hex::encode(stack_root));
+                eprintln!("Merkle root: {:?}", hex::encode(merkle_root));
+
+                // Print the keys around failure
+                for (i, (key, _)) in entries.iter().enumerate() {
+                    let nibbles: Vec<u8> = key.iter().flat_map(|b| [b >> 4, b & 0x0F]).collect();
+                    eprintln!("Key {}: {:?}", i, &nibbles[..8]);
+                }
+                panic!("Failure at n={}", n);
+            }
+        }
+        eprintln!("All tests passed up to 100!");
     }
 
     #[test]

@@ -276,6 +276,32 @@ impl CachedNode {
                     );
 
                     CachedNode::branch(children, None)
+                } else if common_len == remaining.len() {
+                    // New key ends in the middle of extension - split and add value to branch
+                    let mut children: Box<[CachedNode; 16]> = Box::new(Default::default());
+
+                    // The extension continues with the next nibble after common prefix
+                    let ext_nibble = path[common_len] as usize;
+
+                    // Remaining extension after the split
+                    if path.len() > common_len + 1 {
+                        children[ext_nibble] = CachedNode::extension(
+                            path[common_len + 1..].to_vec(),
+                            *child,
+                        );
+                    } else {
+                        children[ext_nibble] = *child;
+                    }
+
+                    // New key's value goes in the branch itself
+                    if common_len > 0 {
+                        CachedNode::extension(
+                            path[..common_len].to_vec(),
+                            CachedNode::branch(children, Some(value)),
+                        )
+                    } else {
+                        CachedNode::branch(children, Some(value))
+                    }
                 } else {
                     // Partial match - split extension
                     let mut children: Box<[CachedNode; 16]> = Box::new(Default::default());

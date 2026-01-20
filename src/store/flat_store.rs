@@ -210,6 +210,7 @@ impl Default for FlatAccountStore {
 /// Iterator over entries in a bucket.
 pub struct BucketIter<'a> {
     store: &'a FlatAccountStore,
+    #[allow(dead_code)]
     bucket: u16,
     keys: Option<&'a [[u8; 32]]>,
     pos: usize,

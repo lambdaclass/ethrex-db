@@ -26,12 +26,14 @@ use crate::merkle::HASH_SIZE;
 pub const NUM_BUCKETS: usize = 65536;
 
 /// Size of the hash array in bytes (65536 * 32 = 2MB).
+#[allow(dead_code)]
 pub const HASH_ARRAY_SIZE: usize = NUM_BUCKETS * HASH_SIZE;
 
 /// Size of the dirty bitmap in bytes (65536 / 8 = 8KB).
 pub const DIRTY_BITMAP_SIZE: usize = NUM_BUCKETS / 8;
 
 /// Size of the count array in bytes (65536 * 4 = 256KB).
+#[allow(dead_code)]
 pub const COUNT_ARRAY_SIZE: usize = NUM_BUCKETS * 4;
 
 /// Cache of subtree hashes at depth 4 (65536 buckets).

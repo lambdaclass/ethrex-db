@@ -7,7 +7,7 @@ use rand::prelude::*;
 
 use ethrex_db::data::{NibblePath, SlottedArray};
 use ethrex_db::merkle::{MerkleTrie, keccak256};
-use ethrex_db::store::{PagedDb, CommitOptions, PageType, StateTrie, StorageTrie, AccountData};
+use ethrex_db::store::{PagedDb, CommitOptions, PageType, StateTrie, AccountData, FlatAccountStore, SubtreeHashCache, StackTrie, ProofGenerator};
 use ethrex_db::chain::Blockchain;
 use primitive_types::{H160, H256, U256};
 
@@ -473,6 +473,70 @@ fn bench_page_cache(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark proof generation: full (no cache) vs lazy (with cache)
+fn bench_proof_generation(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ProofGeneration");
+
+    for size in [100, 1000, 10000].iter() {
+        // Create flat store with entries
+        let mut store = FlatAccountStore::new();
+        let mut cache = SubtreeHashCache::new();
+
+        // Insert entries
+        for i in 0..*size as u32 {
+            let key = keccak256(&i.to_be_bytes());
+            let value = format!("value_{}", i).into_bytes();
+            store.insert(key, value);
+
+            let bucket = SubtreeHashCache::key_to_bucket(&key);
+            cache.mark_non_empty(bucket);
+        }
+
+        // Compute bucket hashes for cache
+        for bucket in cache.non_empty_iter().collect::<Vec<_>>() {
+            let entries: Vec<([u8; 32], Vec<u8>)> = store
+                .entries_in_bucket(bucket)
+                .map(|(k, v)| (k, v.clone()))
+                .collect();
+
+            if !entries.is_empty() {
+                let mut sorted = entries;
+                sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                let mut trie = StackTrie::new();
+                for (key, value) in &sorted {
+                    trie.insert(key, value);
+                }
+                cache.set_hash(bucket, trie.finalize());
+            }
+        }
+
+        // Target key in the middle
+        let target_key = keccak256(&((*size / 2) as u32).to_be_bytes());
+
+        // Benchmark: Full proof (no cache - loads all entries)
+        group.bench_with_input(
+            BenchmarkId::new("full_no_cache", size),
+            &(&store, &target_key),
+            |b, (store, key)| {
+                let generator = ProofGenerator::new(*store);
+                b.iter(|| generator.generate_proof(black_box(*key)))
+            },
+        );
+
+        // Benchmark: Lazy proof (with cache - loads only target bucket)
+        group.bench_with_input(
+            BenchmarkId::new("lazy_with_cache", size),
+            &(&store, &cache, &target_key),
+            |b, (store, cache, key)| {
+                let generator = ProofGenerator::with_cache(*store, *cache);
+                b.iter(|| generator.generate_proof(black_box(*key)))
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_nibble_path,
@@ -486,5 +550,6 @@ criterion_group!(
     bench_paged_db,
     bench_bloom_filter,
     bench_page_cache,
+    bench_proof_generation,
 );
 criterion_main!(benches);

@@ -11,6 +11,7 @@ mod page;
 mod page_header;
 mod page_types;
 mod paged_db;
+mod paged_flat_store;
 mod proof_generator;
 mod sparse_state_trie;
 mod stack_trie;
@@ -30,5 +31,6 @@ pub use trie_store::{PersistentTrie, StateTrie, StorageTrie, AccountData, PagedS
 pub use stack_trie::StackTrie;
 pub use subtree_cache::SubtreeHashCache;
 pub use flat_store::{FlatAccountStore, FlatStorageStore};
+pub use paged_flat_store::PagedFlatStore;
 pub use sparse_state_trie::{SparseStateTrie, SparseStorageTrie};
 pub use proof_generator::{MerkleProof, ProofGenerator};
