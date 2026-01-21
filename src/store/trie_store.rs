@@ -9,7 +9,7 @@
 //! pages on-demand and computes Merkle roots incrementally. This dramatically
 //! reduces memory usage and startup time for large state.
 
-use std::cell::RefCell;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -682,7 +682,7 @@ pub struct LazyStorageTrie {
     /// Root page address
     root_addr: DbAddress,
     /// LRU cache for recently accessed values
-    value_cache: RefCell<LruCache<[u8; 32], Vec<u8>>>,
+    value_cache: Mutex<LruCache<[u8; 32], Vec<u8>>>,
     /// Dirty entries tracking modifications
     dirty: HashMap<[u8; 32], DirtyEntry>,
     /// Cached subtree hashes per page address
@@ -697,7 +697,7 @@ impl LazyStorageTrie {
         Self {
             db,
             root_addr: DbAddress::NULL,
-            value_cache: RefCell::new(LruCache::new(
+            value_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_VALUE_CACHE_SIZE).unwrap()
             )),
             dirty: HashMap::new(),
@@ -711,7 +711,7 @@ impl LazyStorageTrie {
         Self {
             db,
             root_addr,
-            value_cache: RefCell::new(LruCache::new(
+            value_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_VALUE_CACHE_SIZE).unwrap()
             )),
             dirty: HashMap::new(),
@@ -736,7 +736,7 @@ impl LazyStorageTrie {
         }
 
         // Check cache
-        if let Some(v) = self.value_cache.borrow_mut().get(slot_hash) {
+        if let Some(v) = self.value_cache.lock().get(slot_hash) {
             let mut arr = [0u8; 32];
             let len = v.len().min(32);
             arr[32 - len..].copy_from_slice(&v[v.len() - len..]);
@@ -747,7 +747,7 @@ impl LazyStorageTrie {
         let value = self.traverse_for_key(slot_hash)?;
 
         // Cache the result
-        self.value_cache.borrow_mut().put(*slot_hash, value.clone());
+        self.value_cache.lock().put(*slot_hash, value.clone());
 
         let mut arr = [0u8; 32];
         let len = value.len().min(32);
@@ -763,7 +763,7 @@ impl LazyStorageTrie {
             self.dirty.insert(*slot_hash, DirtyEntry::Deleted);
         } else {
             self.dirty.insert(*slot_hash, DirtyEntry::Modified(trimmed.clone()));
-            self.value_cache.borrow_mut().put(*slot_hash, trimmed);
+            self.value_cache.lock().put(*slot_hash, trimmed);
         }
 
         // Invalidate root hash and subtree hashes along the path
@@ -1014,7 +1014,7 @@ pub struct PagedStateTrie {
     /// Root page address
     root_addr: DbAddress,
     /// LRU cache for recently accessed account values (key_hash -> encoded_value)
-    value_cache: RefCell<LruCache<[u8; 32], Vec<u8>>>,
+    value_cache: Mutex<LruCache<[u8; 32], Vec<u8>>>,
     /// Dirty entries tracking account modifications
     dirty: HashMap<[u8; 32], DirtyEntry>,
     /// Cached subtree hashes per page address (for incremental root)
@@ -1033,7 +1033,7 @@ impl PagedStateTrie {
         Self {
             db: Arc::new(PagedDb::in_memory(100).unwrap()),
             root_addr: DbAddress::NULL,
-            value_cache: RefCell::new(LruCache::new(
+            value_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_VALUE_CACHE_SIZE).unwrap()
             )),
             dirty: HashMap::new(),
@@ -1049,7 +1049,7 @@ impl PagedStateTrie {
         Self {
             db,
             root_addr: DbAddress::NULL,
-            value_cache: RefCell::new(LruCache::new(
+            value_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_VALUE_CACHE_SIZE).unwrap()
             )),
             dirty: HashMap::new(),
@@ -1065,7 +1065,7 @@ impl PagedStateTrie {
         Self {
             db,
             root_addr,
-            value_cache: RefCell::new(LruCache::new(
+            value_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_VALUE_CACHE_SIZE).unwrap()
             )),
             dirty: HashMap::new(),
@@ -1126,7 +1126,7 @@ impl PagedStateTrie {
         Ok(Self {
             db: Arc::new(PagedDb::in_memory(100).unwrap()),
             root_addr: Some(root_addr).unwrap_or(DbAddress::NULL),
-            value_cache: RefCell::new(LruCache::new(
+            value_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_VALUE_CACHE_SIZE).unwrap()
             )),
             dirty: HashMap::new(),
@@ -1244,7 +1244,7 @@ impl PagedStateTrie {
         }
 
         // Check value cache
-        if let Some(value) = self.value_cache.borrow_mut().get(address_hash) {
+        if let Some(value) = self.value_cache.lock().get(address_hash) {
             return Some(AccountData::decode(value));
         }
 
@@ -1252,7 +1252,7 @@ impl PagedStateTrie {
         let value = self.traverse_for_key(address_hash)?;
 
         // Cache the result
-        self.value_cache.borrow_mut().put(*address_hash, value.clone());
+        self.value_cache.lock().put(*address_hash, value.clone());
 
         Some(AccountData::decode(&value))
     }
@@ -1367,7 +1367,7 @@ impl PagedStateTrie {
         self.dirty.insert(*address_hash, DirtyEntry::Modified(encoded.clone()));
 
         // Update cache
-        self.value_cache.borrow_mut().put(*address_hash, encoded);
+        self.value_cache.lock().put(*address_hash, encoded);
 
         // Invalidate root hash and subtree hashes
         self.root_hash_cache = None;
@@ -1382,7 +1382,7 @@ impl PagedStateTrie {
         }
 
         self.dirty.insert(*address_hash, DirtyEntry::Modified(rlp_encoded.clone()));
-        self.value_cache.borrow_mut().put(*address_hash, rlp_encoded);
+        self.value_cache.lock().put(*address_hash, rlp_encoded);
         self.root_hash_cache = None;
         self.invalidate_path(address_hash);
     }
@@ -1397,7 +1397,7 @@ impl PagedStateTrie {
         for (address_hash, account) in accounts {
             let encoded = account.encode();
             self.dirty.insert(address_hash, DirtyEntry::Modified(encoded.clone()));
-            self.value_cache.borrow_mut().put(address_hash, encoded);
+            self.value_cache.lock().put(address_hash, encoded);
         }
         self.root_hash_cache = None;
     }
@@ -1967,7 +1967,7 @@ pub struct DiskMptStateTrie {
     /// Storage tries per account (using DiskMpt)
     storage_tries: HashMap<[u8; 32], DiskMpt>,
     /// Value cache for recently accessed accounts
-    value_cache: RefCell<LruCache<[u8; 32], Vec<u8>>>,
+    value_cache: Mutex<LruCache<[u8; 32], Vec<u8>>>,
 }
 
 impl DiskMptStateTrie {
@@ -1976,7 +1976,7 @@ impl DiskMptStateTrie {
         Self {
             account_mpt: DiskMpt::new(),
             storage_tries: HashMap::new(),
-            value_cache: RefCell::new(LruCache::new(
+            value_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_VALUE_CACHE_SIZE).unwrap()
             )),
         }
@@ -1987,7 +1987,7 @@ impl DiskMptStateTrie {
         Self {
             account_mpt: DiskMpt::from_root(root_addr),
             storage_tries: HashMap::new(),
-            value_cache: RefCell::new(LruCache::new(
+            value_cache: Mutex::new(LruCache::new(
                 NonZeroUsize::new(DEFAULT_VALUE_CACHE_SIZE).unwrap()
             )),
         }
@@ -2016,14 +2016,14 @@ impl DiskMptStateTrie {
     /// Gets an account by pre-hashed address.
     pub fn get_account_by_hash(&self, batch: &BatchContext, address_hash: &[u8; 32]) -> Option<AccountData> {
         // Check cache first
-        if let Some(value) = self.value_cache.borrow_mut().get(address_hash) {
+        if let Some(value) = self.value_cache.lock().get(address_hash) {
             return Some(AccountData::decode(value));
         }
 
         // Query disk MPT
         match self.account_mpt.get(batch, address_hash).ok().flatten() {
             Some(value) => {
-                self.value_cache.borrow_mut().put(*address_hash, value.clone());
+                self.value_cache.lock().put(*address_hash, value.clone());
                 Some(AccountData::decode(&value))
             }
             None => None,
@@ -2039,7 +2039,7 @@ impl DiskMptStateTrie {
     /// Sets an account using a pre-hashed address.
     pub fn set_account_by_hash(&mut self, batch: &mut BatchContext, address_hash: &[u8; 32], account: AccountData) {
         let encoded = account.encode();
-        self.value_cache.borrow_mut().put(*address_hash, encoded.clone());
+        self.value_cache.lock().put(*address_hash, encoded.clone());
 
         // Insert into the MPT
         if let Err(e) = self.account_mpt.insert(batch, address_hash, encoded) {
@@ -2049,7 +2049,7 @@ impl DiskMptStateTrie {
 
     /// Sets an account using raw RLP-encoded data.
     pub fn set_account_raw(&mut self, batch: &mut BatchContext, address_hash: &[u8; 32], rlp_encoded: Vec<u8>) {
-        self.value_cache.borrow_mut().put(*address_hash, rlp_encoded.clone());
+        self.value_cache.lock().put(*address_hash, rlp_encoded.clone());
 
         if let Err(e) = self.account_mpt.insert(batch, address_hash, rlp_encoded) {
             warn!("Failed to insert account: {:?}", e);
@@ -2060,7 +2060,7 @@ impl DiskMptStateTrie {
     pub fn set_accounts_batch(&mut self, batch: &mut BatchContext, accounts: impl IntoIterator<Item = ([u8; 32], AccountData)>) {
         for (address_hash, account) in accounts {
             let encoded = account.encode();
-            self.value_cache.borrow_mut().put(address_hash, encoded.clone());
+            self.value_cache.lock().put(address_hash, encoded.clone());
             if let Err(e) = self.account_mpt.insert(batch, &address_hash, encoded) {
                 warn!("Failed to insert account in batch: {:?}", e);
             }
@@ -2119,12 +2119,12 @@ impl DiskMptStateTrie {
                 .unwrap_or(EMPTY_ROOT);
 
             // Get current account and update storage root if needed
-            if let Some(value) = self.value_cache.borrow().peek(&addr_hash).cloned() {
+            if let Some(value) = self.value_cache.lock().peek(&addr_hash).cloned() {
                 let mut account = AccountData::decode(&value);
                 if account.storage_root != storage_root {
                     account.storage_root = storage_root;
                     let encoded = account.encode();
-                    self.value_cache.borrow_mut().put(addr_hash, encoded.clone());
+                    self.value_cache.lock().put(addr_hash, encoded.clone());
                     let _ = self.account_mpt.insert(batch, &addr_hash, encoded);
                 }
             }
@@ -2151,12 +2151,12 @@ impl DiskMptStateTrie {
     /// Returns the number of accounts (approximate for DiskMpt).
     pub fn account_count(&self) -> usize {
         // DiskMpt doesn't track count directly, return cache size as estimate
-        self.value_cache.borrow().len()
+        self.value_cache.lock().len()
     }
 
     /// Clears the value cache.
     pub fn clear_cache(&mut self) {
-        self.value_cache.borrow_mut().clear();
+        self.value_cache.lock().clear();
     }
 }
 

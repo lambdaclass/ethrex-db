@@ -9,7 +9,7 @@ license = "MIT"
 memmap2 = "0.9"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 rlp = "0.5"
-primitive-types = "0.12"
+primitive-types = "0.13"
 parking_lot = "0.12"
 thiserror = "1.0"
 tracing = "0.1"
