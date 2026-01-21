@@ -483,10 +483,63 @@ impl Blockchain {
         if let Some(finalized) = finalized_hash {
             if finalized != *self.last_finalized_hash.read().unwrap() {
                 self.finalize(finalized)?;
+                // Prune any stale blocks after finalization
+                self.prune_stale_blocks();
             }
         }
 
         Ok(())
+    }
+
+    /// Removes stale blocks from hot storage.
+    ///
+    /// Stale blocks are blocks that are at or below the finalized block number
+    /// but are not on the canonical chain (i.e., they were part of a reorg).
+    /// This method should be called after finalization to clean up memory.
+    pub fn prune_stale_blocks(&self) -> usize {
+        let finalized_number = *self.last_finalized.read().unwrap();
+        let finalized_hash = *self.last_finalized_hash.read().unwrap();
+
+        let mut blocks_to_remove = Vec::new();
+
+        // Find all blocks at or below finalized number that aren't finalized
+        {
+            let blocks = self.blocks_by_hash.read().unwrap();
+            for (hash, committed) in blocks.iter() {
+                // Remove blocks at or below finalized height (except genesis handling)
+                if committed.block.number() <= finalized_number && *hash != finalized_hash {
+                    blocks_to_remove.push(*hash);
+                }
+            }
+        }
+
+        let count = blocks_to_remove.len();
+
+        if count > 0 {
+            let mut blocks_by_hash = self.blocks_by_hash.write().unwrap();
+            let mut blocks_by_number = self.blocks_by_number.write().unwrap();
+
+            for hash in &blocks_to_remove {
+                if let Some(committed) = blocks_by_hash.remove(hash) {
+                    // Also clean up the number index
+                    let block_num = committed.block.number();
+                    if let Some(hashes) = blocks_by_number.get_mut(&block_num) {
+                        hashes.retain(|h| h != hash);
+                        if hashes.is_empty() {
+                            blocks_by_number.remove(&block_num);
+                        }
+                    }
+                }
+            }
+
+            tracing::debug!(
+                "Pruned {} stale blocks from hot storage (finalized at {})",
+                count,
+                finalized_number
+            );
+        }
+
+        count
     }
 }
 
