@@ -176,13 +176,13 @@ fn test_keccak256() {
     // Test against known Ethereum values
     let empty = keccak256(&[]);
     assert_eq!(
-        hex::encode(empty),
+        hex_simd::encode_to_string(empty, hex_simd::AsciiCase::Lower),
         "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
     );
 
     let hello = keccak256(b"hello");
     assert_eq!(
-        hex::encode(hello),
+        hex_simd::encode_to_string(hello, hex_simd::AsciiCase::Lower),
         "1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8"
     );
 }

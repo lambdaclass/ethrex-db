@@ -24,9 +24,10 @@ pub enum NodeType {
 /// Per Ethereum's MPT spec:
 /// - If the RLP encoding of a child is >= 32 bytes, store the keccak256 hash
 /// - If the RLP encoding is < 32 bytes, embed the RLP directly (inline)
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum ChildRef {
     /// Empty child (null).
+    #[default]
     Empty,
     /// Child whose RLP encoding is >= 32 bytes - stored as keccak256 hash.
     Hash([u8; HASH_SIZE]),

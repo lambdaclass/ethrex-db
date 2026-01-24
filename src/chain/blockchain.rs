@@ -364,9 +364,7 @@ impl Blockchain {
                         let slot: [u8; 32] = *key.as_fixed_bytes();
 
                         // U256 values need to be converted
-                        let val = value.to_big_endian();
-
-                        storage.set(&slot, val);
+                        storage.set(&slot, value.to_big_endian());
                     }
                 }
             }
