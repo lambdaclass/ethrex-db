@@ -132,6 +132,24 @@ impl Blockchain {
         *self.state_trie.write().unwrap() = state_trie;
     }
 
+    /// Inserts a raw RLP-encoded account into the state trie using a pre-hashed address.
+    ///
+    /// Used during state transfer after snap sync. The caller provides the data
+    /// exactly as it appears in the state trie (keccak(address) key, RLP value).
+    pub fn set_account_raw(&self, address_hash: &[u8; 32], rlp_encoded: Vec<u8>) {
+        self.state_trie.write().unwrap().set_account_raw(address_hash, rlp_encoded);
+    }
+
+    /// Inserts a raw RLP-encoded storage value into a storage trie using pre-hashed keys.
+    ///
+    /// Used during state transfer after snap sync. The caller provides the data
+    /// exactly as it appears in the storage trie (keccak(slot) key, RLP value).
+    pub fn storage_set_raw(&self, address_hash: &[u8; 32], slot_hash: &[u8; 32], rlp_encoded: Vec<u8>) {
+        let mut state_trie = self.state_trie.write().unwrap();
+        let storage = state_trie.storage_trie_by_hash(address_hash);
+        storage.set_raw(slot_hash, rlp_encoded);
+    }
+
     /// Persists the current state trie to the database.
     ///
     /// Used by snap sync after populating the state trie to persist it to disk.
