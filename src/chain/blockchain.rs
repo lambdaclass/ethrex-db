@@ -161,6 +161,51 @@ impl Blockchain {
         self.state_trie.write().unwrap().flush_storage_tries()
     }
 
+    /// Applies account and storage changes directly to the finalized state trie.
+    ///
+    /// Updates the finalized block number and hash in memory.
+    /// Does NOT persist to disk and does NOT compute state root.
+    /// Used for sequential block execution where state root verification
+    /// is handled separately (e.g., trusted canonical chain after snap sync).
+    pub fn apply_to_finalized(
+        &self,
+        block_number: u64,
+        block_hash: H256,
+        account_changes: &[(H256, Option<Account>)],
+        storage_changes: &[(H256, Vec<(H256, U256)>)],
+    ) {
+        let mut state_trie = self.state_trie.write().unwrap();
+
+        // Apply account changes
+        for (addr, account_opt) in account_changes {
+            let addr_hash: [u8; 32] = *addr.as_fixed_bytes();
+            match account_opt {
+                Some(account) => {
+                    state_trie.set_account_by_hash(&addr_hash, account_to_data(account));
+                }
+                None => {
+                    state_trie.set_account_by_hash(&addr_hash, AccountData::empty());
+                }
+            }
+        }
+
+        // Apply storage changes
+        for (addr, slots) in storage_changes {
+            let addr_hash: [u8; 32] = *addr.as_fixed_bytes();
+            let storage = state_trie.storage_trie_by_hash(&addr_hash);
+            for (key, value) in slots {
+                let slot_hash: [u8; 32] = *key.as_fixed_bytes();
+                storage.set_by_hash(&slot_hash, value.to_big_endian());
+            }
+        }
+
+        drop(state_trie);
+
+        // Update finalized metadata
+        *self.last_finalized.write().unwrap() = block_number;
+        *self.last_finalized_hash.write().unwrap() = block_hash;
+    }
+
     /// Persists the current state trie to the database.
     ///
     /// Used by snap sync after populating the state trie to persist it to disk.
