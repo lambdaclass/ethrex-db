@@ -806,3 +806,65 @@ fn test_e2e_incremental_finalization() {
     let root_after_5 = blockchain.state_root();
     assert_ne!(root_after_5, root_after_4);
 }
+
+#[test]
+fn test_e2e_state_persist_and_reload_with_fanout() {
+    // Test that persisting and reloading a state trie with many accounts
+    // (enough to require fanout pages) preserves all data correctly.
+    // This exercises the save_recursive / load_from_data_page_with_prefix path.
+    use ethrex_db::store::{PagedStateTrie, AccountData};
+
+    let mut db = PagedDb::in_memory(50_000).unwrap();
+
+    // Create a state trie with enough accounts to exceed a single leaf page.
+    // Each account entry is ~100+ bytes, a 4KB page holds ~30 entries.
+    // 500 accounts guarantees fanout is triggered across multiple buckets.
+    let mut trie = PagedStateTrie::new();
+    let account_count = 500;
+    let mut expected: Vec<([u8; 32], u64, [u8; 32])> = Vec::new();
+
+    for i in 0u64..account_count {
+        let addr_hash = keccak256(&i.to_be_bytes());
+        let mut balance = [0u8; 32];
+        balance[24..32].copy_from_slice(&(i * 1000 + 42).to_be_bytes());
+        let account = AccountData {
+            nonce: i,
+            balance,
+            storage_root: [0u8; 32],
+            code_hash: AccountData::EMPTY_CODE_HASH,
+        };
+        trie.set_account_by_hash(&addr_hash, account);
+        expected.push((addr_hash, i, balance));
+    }
+
+    // Persist
+    {
+        let mut batch = db.begin_batch();
+        let root_addr = trie.save(&mut batch).unwrap();
+        assert!(!root_addr.is_null());
+        batch.set_state_root(root_addr);
+        batch.set_metadata(1, &[0xAA; 32]);
+        batch.commit(CommitOptions::DangerNoFlush).unwrap();
+    }
+
+    // Reload from the persisted state
+    let state_root = db.begin_read_only().state_root();
+    assert!(!state_root.is_null());
+    let loaded = PagedStateTrie::load(&db, state_root).unwrap();
+
+    // Verify every account is present with the correct data
+    let mut found = 0;
+    for (addr_hash, expected_nonce, expected_balance) in &expected {
+        let account = loaded.get_account_by_hash(addr_hash);
+        assert!(
+            account.is_some(),
+            "Account with nonce {} not found after reload",
+            expected_nonce
+        );
+        let account = account.unwrap();
+        assert_eq!(account.nonce, *expected_nonce, "Nonce mismatch for account {}", expected_nonce);
+        assert_eq!(account.balance, *expected_balance, "Balance mismatch for account {}", expected_nonce);
+        found += 1;
+    }
+    assert_eq!(found, account_count as usize);
+}

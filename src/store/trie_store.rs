@@ -808,14 +808,25 @@ impl PagedStateTrie {
     }
 
     fn load_from_data_page(db: &PagedDb, page: &crate::store::Page, state: &mut StateTrie) -> Result<(), DbError> {
+        Self::load_from_data_page_with_prefix(db, page, state, &[])
+    }
+
+    fn load_from_data_page_with_prefix(db: &PagedDb, page: &crate::store::Page, state: &mut StateTrie, prefix: &[u8]) -> Result<(), DbError> {
         let data_page = DataPage::wrap(page.clone());
 
-        // Iterate through all buckets
+        // Iterate through all buckets.
+        // The save function strips the first byte of each key and uses it as the
+        // bucket index. We must prepend it back when loading.
         for i in 0..256 {
             let child_addr = data_page.get_bucket(i);
             if !child_addr.is_null() {
                 let child_page = db.get_page(child_addr)?;
                 let child_type = child_page.header().get_page_type();
+
+                // Build the full prefix for entries in this bucket
+                let mut full_prefix = Vec::with_capacity(prefix.len() + 1);
+                full_prefix.extend_from_slice(prefix);
+                full_prefix.push(i as u8);
 
                 match child_type {
                     Some(PageType::Leaf) => {
@@ -823,16 +834,19 @@ impl PagedStateTrie {
                         let arr = SlottedArray::from_bytes(Self::payload_to_array(leaf.data()));
 
                         for (path, value) in arr.iter() {
-                            let key = PersistentTrie::nibble_path_to_bytes(&path);
+                            let remaining = PersistentTrie::nibble_path_to_bytes(&path);
                             let mut addr_hash = [0u8; 32];
-                            let copy_len = key.len().min(32);
-                            addr_hash[..copy_len].copy_from_slice(&key[..copy_len]);
+                            let prefix_len = full_prefix.len().min(32);
+                            addr_hash[..prefix_len].copy_from_slice(&full_prefix[..prefix_len]);
+                            let remaining_len = remaining.len().min(32 - prefix_len);
+                            addr_hash[prefix_len..prefix_len + remaining_len]
+                                .copy_from_slice(&remaining[..remaining_len]);
                             state.trie.insert(&addr_hash, value);
                         }
                     }
                     Some(PageType::Data) => {
-                        // Recursive fanout
-                        Self::load_from_data_page(db, &child_page, state)?;
+                        // Recursive fanout — pass accumulated prefix
+                        Self::load_from_data_page_with_prefix(db, &child_page, state, &full_prefix)?;
                     }
                     _ => {}
                 }
@@ -913,12 +927,29 @@ impl PagedStateTrie {
             return Ok(DbAddress::NULL);
         }
 
-        // Try to fit everything in a single leaf page
+        let addr = Self::save_recursive(batch, &entries, 0)?;
+        self.root_addr = Some(addr);
+        Ok(addr)
+    }
+
+    /// Recursively saves entries using fanout by key byte at `depth`.
+    ///
+    /// If all entries fit in a single leaf page, creates a leaf.
+    /// Otherwise, creates a DataPage with 256 buckets keyed by the byte
+    /// at position `depth`, and recurses for each bucket at `depth + 1`.
+    fn save_recursive(batch: &mut BatchContext, entries: &[(Vec<u8>, Vec<u8>)], depth: usize) -> Result<DbAddress, DbError> {
+        if entries.is_empty() {
+            return Ok(DbAddress::NULL);
+        }
+
+        // Try to fit all entries in a single leaf page.
+        // Store only the key suffix starting at `depth`.
         let mut arr = SlottedArray::new();
         let mut all_fit = true;
 
-        for (key, value) in &entries {
-            let path = NibblePath::from_bytes(key);
+        for (key, value) in entries {
+            let suffix = if key.len() > depth { &key[depth..] } else { &[] };
+            let path = NibblePath::from_bytes(suffix);
             if !arr.try_insert(&path, value) {
                 all_fit = false;
                 break;
@@ -926,130 +957,39 @@ impl PagedStateTrie {
         }
 
         if all_fit {
-            // Everything fits in one page
-            let (addr, _page) = batch.allocate_page(PageType::Leaf, 0)?;
+            let (addr, _) = batch.allocate_page(PageType::Leaf, depth as u8)?;
             let arr_bytes = arr.as_bytes();
-
-            // Get a mutable copy and write
             let mut leaf_page = batch.get_writable_copy(addr)?;
             let payload = leaf_page.payload_mut();
             let copy_len = payload.len().min(arr_bytes.len());
             payload[..copy_len].copy_from_slice(&arr_bytes[..copy_len]);
             batch.mark_dirty(addr, leaf_page);
-
-            self.root_addr = Some(addr);
             return Ok(addr);
         }
 
-        // Need to use fanout structure
-        Self::save_with_fanout_static(&mut self.root_addr, batch, &entries)
-    }
-
-    fn save_with_fanout_static(root_addr: &mut Option<DbAddress>, batch: &mut BatchContext, entries: &[(Vec<u8>, Vec<u8>)]) -> Result<DbAddress, DbError> {
-        // Group entries by first byte (256 buckets)
-        let mut buckets: Vec<Vec<(&[u8], &[u8])>> = vec![Vec::new(); 256];
+        // Doesn't fit — fanout by the byte at `depth`
+        let mut buckets: Vec<Vec<(Vec<u8>, Vec<u8>)>> = (0..256).map(|_| Vec::new()).collect();
 
         for (key, value) in entries {
-            if !key.is_empty() {
-                let bucket_idx = key[0] as usize;
-                buckets[bucket_idx].push((key.as_slice(), value.as_slice()));
+            if key.len() > depth {
+                let bucket_idx = key[depth] as usize;
+                buckets[bucket_idx].push((key.clone(), value.clone()));
             }
         }
 
-        // Allocate root data page
-        let (addr, _) = batch.allocate_page(PageType::Data, 0)?;
+        let (addr, _) = batch.allocate_page(PageType::Data, depth as u8)?;
         let root_page = batch.get_writable_copy(addr)?;
         let mut data_page = DataPage::wrap(root_page);
 
-        // Process each bucket
-        for (i, bucket_entries) in buckets.iter().enumerate() {
-            if bucket_entries.is_empty() {
-                continue;
-            }
-
-            // Try to fit bucket in a leaf page
-            let mut arr = SlottedArray::new();
-            let mut all_fit = true;
-
-            for (key, value) in bucket_entries {
-                // Skip first byte since it's encoded in the bucket index
-                let remaining = if key.len() > 1 { &key[1..] } else { &[] };
-                let path = NibblePath::from_bytes(remaining);
-                if !arr.try_insert(&path, value) {
-                    all_fit = false;
-                    break;
-                }
-            }
-
-            if all_fit {
-                // Create leaf page for this bucket
-                let (leaf_addr, _) = batch.allocate_page(PageType::Leaf, 1)?;
-                let mut leaf_page = batch.get_writable_copy(leaf_addr)?;
-                let arr_bytes = arr.as_bytes();
-                let payload = leaf_page.payload_mut();
-                let copy_len = payload.len().min(arr_bytes.len());
-                payload[..copy_len].copy_from_slice(&arr_bytes[..copy_len]);
-                batch.mark_dirty(leaf_addr, leaf_page);
-
-                data_page.set_bucket(i, leaf_addr);
-            } else {
-                // Need recursive fanout (for very large buckets)
-                // For now, just split across multiple leaf pages
-                let first_leaf = Self::save_bucket_multi_page_static(batch, bucket_entries)?;
-                data_page.set_bucket(i, first_leaf);
+        for (i, bucket) in buckets.iter().enumerate() {
+            if !bucket.is_empty() {
+                let child_addr = Self::save_recursive(batch, bucket, depth + 1)?;
+                data_page.set_bucket(i, child_addr);
             }
         }
 
         batch.mark_dirty(addr, data_page.into_page());
-        *root_addr = Some(addr);
         Ok(addr)
-    }
-
-    fn save_bucket_multi_page_static(batch: &mut BatchContext, entries: &[(&[u8], &[u8])]) -> Result<DbAddress, DbError> {
-        // Simple approach: just create multiple leaf pages and link them
-        // In a production implementation, this would use a proper tree structure
-        let mut first_addr = DbAddress::NULL;
-        let mut arr = SlottedArray::new();
-
-        for (key, value) in entries {
-            let remaining = if key.len() > 1 { &key[1..] } else { &[] };
-            let path = NibblePath::from_bytes(remaining);
-
-            if !arr.try_insert(&path, value) {
-                // Save current page and start new one
-                let (addr, _) = batch.allocate_page(PageType::Leaf, 1)?;
-                let mut page = batch.get_writable_copy(addr)?;
-                let arr_bytes = arr.as_bytes();
-                let payload = page.payload_mut();
-                let copy_len = payload.len().min(arr_bytes.len());
-                payload[..copy_len].copy_from_slice(&arr_bytes[..copy_len]);
-                batch.mark_dirty(addr, page);
-
-                if first_addr.is_null() {
-                    first_addr = addr;
-                }
-
-                arr = SlottedArray::new();
-                arr.try_insert(&path, value);
-            }
-        }
-
-        // Save last page if non-empty
-        if arr.live_count() > 0 {
-            let (addr, _) = batch.allocate_page(PageType::Leaf, 1)?;
-            let mut page = batch.get_writable_copy(addr)?;
-            let arr_bytes = arr.as_bytes();
-            let payload = page.payload_mut();
-            let copy_len = payload.len().min(arr_bytes.len());
-            payload[..copy_len].copy_from_slice(&arr_bytes[..copy_len]);
-            batch.mark_dirty(addr, page);
-
-            if first_addr.is_null() {
-                first_addr = addr;
-            }
-        }
-
-        Ok(first_addr)
     }
 
     /// Gets an account by address.
