@@ -119,6 +119,11 @@ impl Blockchain {
         }
     }
 
+    /// Returns a reference to the underlying database.
+    pub fn db_ref(&self) -> &Arc<RwLock<PagedDb>> {
+        &self.db
+    }
+
     /// Replaces the state trie with a new one.
     ///
     /// Used by snap sync to set the trie after it has been populated.
