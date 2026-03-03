@@ -1443,19 +1443,4 @@ mod genesis_debug_tests {
         // code_hash (32 bytes): 0xa0 + 32 bytes
     }
 
-    #[test]
-    fn debug_trie_root_single_account() {
-        let mut state = StateTrie::new();
-        let address = [0u8; 20]; // zero address
-        let account = AccountData {
-            nonce: 0,
-            balance: [0u8; 32],
-            storage_root: EMPTY_ROOT,
-            code_hash: AccountData::EMPTY_CODE_HASH,
-        };
-
-        state.set_account(&address, account);
-        let root = state.root_hash();
-        eprintln!("Root hash for single account: {}", hex::encode(root));
-    }
 }

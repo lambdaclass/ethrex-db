@@ -338,10 +338,6 @@ impl Blockchain {
 
                 let account_changes: Vec<_> = block.account_changes().collect();
                 let storage_changes: Vec<_> = block.storage_changes().collect();
-                eprintln!(
-                    "[ethrex-db finalize] block {:?}: {} account changes, {} storage changes",
-                    hash, account_changes.len(), storage_changes.len()
-                );
 
                 // Apply account changes to state trie
                 for (addr, account_opt) in account_changes {
