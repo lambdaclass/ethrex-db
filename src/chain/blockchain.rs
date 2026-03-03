@@ -367,13 +367,13 @@ impl Blockchain {
                     let storage = state_trie.storage_trie_by_hash(&addr_hash);
 
                     for (key, value) in slots {
-                        // H256 keys are already big-endian
-                        let slot: [u8; 32] = *key.as_fixed_bytes();
+                        // Keys are already keccak-hashed (pre-hashed in store layer)
+                        let slot_hash: [u8; 32] = *key.as_fixed_bytes();
 
                         // U256 values need to be converted
                         let val = value.to_big_endian();
 
-                        storage.set(&slot, val);
+                        storage.set_by_hash(&slot_hash, val);
                     }
                 }
             }
@@ -512,8 +512,9 @@ impl Blockchain {
             let addr_hash: [u8; 32] = *addr.as_fixed_bytes();
             let storage = temp_state.storage_trie_by_hash(&addr_hash);
             for (key, value) in slots {
-                let slot: [u8; 32] = *key.as_fixed_bytes();
-                storage.set(&slot, value.to_big_endian());
+                // Keys are already keccak-hashed (pre-hashed in store layer)
+                let slot_hash: [u8; 32] = *key.as_fixed_bytes();
+                storage.set_by_hash(&slot_hash, value.to_big_endian());
             }
         }
 

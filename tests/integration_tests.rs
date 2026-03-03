@@ -708,17 +708,21 @@ fn test_e2e_trie_edge_cases() {
 
 #[test]
 fn test_e2e_state_persistence() {
-    // Test full state persistence: create blocks, finalize, and verify state root
+    // Test full state persistence: create blocks, finalize, and verify state root.
+    // Block keys must be keccak256(address) since finalize() treats them as pre-hashed.
     let db = PagedDb::in_memory(1000).unwrap();
     let blockchain = Blockchain::new(db);
 
-    // Create and commit several blocks with state changes
     let genesis_hash = blockchain.last_finalized_hash();
+
+    // Use 20-byte addresses and keccak-hash them for block keys (matching store layer)
+    let raw_addr1 = [0x01u8; 20];
+    let raw_addr2 = [0x02u8; 20];
+    let addr1 = H256::from(keccak256(&raw_addr1));
+    let addr2 = H256::from(keccak256(&raw_addr2));
 
     // Block 1: Create two accounts
     let mut block1 = blockchain.start_new(genesis_hash, H256::from_low_u64_be(1), 1).unwrap();
-    let addr1 = H256::repeat_byte(0x01);
-    let addr2 = H256::repeat_byte(0x02);
     block1.set_account(addr1, Account::with_balance(U256::from(1000)));
     block1.set_account(addr2, Account::with_balance(U256::from(2000)));
     blockchain.commit(block1).unwrap();
@@ -726,13 +730,17 @@ fn test_e2e_state_persistence() {
     // Block 2: Update account 1, add storage to account 2
     let mut block2 = blockchain.start_new(H256::from_low_u64_be(1), H256::from_low_u64_be(2), 2).unwrap();
     block2.set_account(addr1, Account::with_balance(U256::from(900)));
-    block2.set_storage(addr2, H256::repeat_byte(0xAA), U256::from(42));
+    // Storage keys should also be keccak-hashed
+    let storage_key_aa = H256::from(keccak256(&H256::repeat_byte(0xAA).0));
+    block2.set_storage(addr2, storage_key_aa, U256::from(42));
     blockchain.commit(block2).unwrap();
 
     // Block 3: More storage changes
     let mut block3 = blockchain.start_new(H256::from_low_u64_be(2), H256::from_low_u64_be(3), 3).unwrap();
-    block3.set_storage(addr2, H256::repeat_byte(0xBB), U256::from(100));
-    block3.set_storage(addr2, H256::repeat_byte(0xCC), U256::from(200));
+    let storage_key_bb = H256::from(keccak256(&H256::repeat_byte(0xBB).0));
+    let storage_key_cc = H256::from(keccak256(&H256::repeat_byte(0xCC).0));
+    block3.set_storage(addr2, storage_key_bb, U256::from(100));
+    block3.set_storage(addr2, storage_key_cc, U256::from(200));
     blockchain.commit(block3).unwrap();
 
     // Before finalization, state root should be empty (no finalized state)
@@ -746,9 +754,8 @@ fn test_e2e_state_persistence() {
     let final_root = blockchain.state_root();
     assert_ne!(final_root, EMPTY_ROOT);
 
-    // Query finalized state
-    let addr1_bytes: [u8; 20] = addr1.as_bytes()[12..32].try_into().unwrap();
-    let account1 = blockchain.get_finalized_account(&addr1_bytes);
+    // Query finalized state using raw address (get_finalized_account hashes internally)
+    let account1 = blockchain.get_finalized_account(&raw_addr1);
     assert!(account1.is_some());
     assert_eq!(account1.unwrap().balance, U256::from(900));
 

@@ -1038,117 +1038,79 @@ mod eth_foundation_tests {
     use super::*;
 
     /// Test from trietest.json: "emptyValues"
-    /// Tests that inserting empty values is equivalent to not inserting
+    /// Applies insertions and deletions, verifies root against official expected hash.
     #[test]
     fn test_trie_empty_values() {
         let mut trie = MerkleTrie::new();
 
-        // From test vector (hex-decoded keys)
-        trie.insert(&hex!("646f"), b"verb".to_vec());      // "do"
-        trie.insert(&hex!("686f727365"), b"stallion".to_vec()); // "horse"
-        trie.insert(&hex!("646f6765"), b"coin".to_vec());  // "doge"
-        trie.insert(&hex!("646f67"), b"puppy".to_vec());   // "dog"
+        // From ethereum/tests trietest.json "emptyValues"
+        // Apply operations in order (null = delete)
+        trie.insert(b"do", b"verb".to_vec());
+        trie.insert(b"ether", b"wookiedoo".to_vec());
+        trie.insert(b"horse", b"stallion".to_vec());
+        trie.insert(b"shaman", b"horse".to_vec());
+        trie.insert(b"doge", b"coin".to_vec());
+        trie.remove(b"ether");   // "ether" → null
+        trie.insert(b"dog", b"puppy".to_vec());
+        trie.remove(b"shaman");  // "shaman" → null
 
-        // Expected root from ethereum/tests
-        // Note: This may differ if our implementation differs in details
-        let root = trie.root_hash();
+        // Verify final state
+        assert_eq!(trie.get(b"do"), Some(b"verb".as_slice()));
+        assert_eq!(trie.get(b"horse"), Some(b"stallion".as_slice()));
+        assert_eq!(trie.get(b"doge"), Some(b"coin".as_slice()));
+        assert_eq!(trie.get(b"dog"), Some(b"puppy".as_slice()));
+        assert_eq!(trie.get(b"ether"), None);
+        assert_eq!(trie.get(b"shaman"), None);
 
-        // Verify all values
-        assert_eq!(trie.get(&hex!("646f")), Some(b"verb".as_slice()));
-        assert_eq!(trie.get(&hex!("686f727365")), Some(b"stallion".as_slice()));
-        assert_eq!(trie.get(&hex!("646f6765")), Some(b"coin".as_slice()));
-        assert_eq!(trie.get(&hex!("646f67")), Some(b"puppy".as_slice()));
+        // Expected root from ethereum/tests trietest.json
+        let expected_root = hex!("5991bb8c6514148a29db676a14ac506cd2cd5775ace63c30a4fe457715e9ac84");
+        assert_eq!(trie.root_hash(), expected_root, "emptyValues root mismatch");
+    }
 
-        // Root should be non-empty and deterministic
-        assert_ne!(root, EMPTY_ROOT);
+    /// Test from trietest.json: "branch-value-update"
+    #[test]
+    fn test_trie_branch_value_update() {
+        let mut trie = MerkleTrie::new();
 
-        // Recreate in different order
+        trie.insert(b"abc", b"123".to_vec());
+        trie.insert(b"abcd", b"abcd".to_vec());
+        trie.insert(b"abc", b"abc".to_vec()); // update
+
+        let expected_root = hex!("7a320748f780ad9ad5b0837302075ce0eeba6c26e3d8562c67ccc0f1b273298a");
+        assert_eq!(trie.root_hash(), expected_root, "branch-value-update root mismatch");
+    }
+
+    /// Test from trietest.json: "insert-middle-leaf"
+    #[test]
+    fn test_trie_insert_middle_leaf() {
+        let mut trie = MerkleTrie::new();
+
+        trie.insert(b"key1aa", b"0123456789012345678901234567890123456789xxx".to_vec());
+        trie.insert(b"key1", b"0123456789012345678901234567890123456789Very_Long".to_vec());
+        trie.insert(b"key2bb", b"aval3".to_vec());
+        trie.insert(b"key2", b"short".to_vec());
+        trie.insert(b"key3cc", b"aval3".to_vec());
+        trie.insert(b"key3", b"1234567890123456789012345678901".to_vec());
+
+        let expected_root = hex!("cb65032e2f76c48b82b5c24b3db8f670ce73982869d38cd39a624f23d62a9e89");
+        assert_eq!(trie.root_hash(), expected_root, "insert-middle-leaf root mismatch");
+    }
+
+    /// Test order independence: same data in different order produces same root
+    #[test]
+    fn test_trie_order_independence() {
+        let mut trie1 = MerkleTrie::new();
+        trie1.insert(b"do", b"verb".to_vec());
+        trie1.insert(b"horse", b"stallion".to_vec());
+        trie1.insert(b"doge", b"coin".to_vec());
+        trie1.insert(b"dog", b"puppy".to_vec());
+
         let mut trie2 = MerkleTrie::new();
-        trie2.insert(&hex!("646f67"), b"puppy".to_vec());
-        trie2.insert(&hex!("646f6765"), b"coin".to_vec());
-        trie2.insert(&hex!("686f727365"), b"stallion".to_vec());
-        trie2.insert(&hex!("646f"), b"verb".to_vec());
+        trie2.insert(b"dog", b"puppy".to_vec());
+        trie2.insert(b"doge", b"coin".to_vec());
+        trie2.insert(b"horse", b"stallion".to_vec());
+        trie2.insert(b"do", b"verb".to_vec());
 
-        assert_eq!(trie2.root_hash(), root);
-    }
-
-    /// Test from trietest.json: "jeff"
-    /// Complex test with many operations
-    #[test]
-    fn test_trie_jeff() {
-        let mut trie = MerkleTrie::new();
-
-        // Key-value pairs from the "jeff" test
-        trie.insert(
-            &hex!("6b6579316161"),  // "key1aa"
-            hex!("0123456789012345678901234567890123456789012345678901234567890123456789").to_vec()
-        );
-        trie.insert(
-            &hex!("6b657932bb"),  // "key2bb"
-            b"aval3".to_vec()
-        );
-        trie.insert(
-            &hex!("6b657933cc"),  // "key3cc"
-            b"aval3".to_vec()
-        );
-
-        // All values retrievable
-        assert!(trie.get(&hex!("6b6579316161")).is_some());
-        assert!(trie.get(&hex!("6b657932bb")).is_some());
-        assert!(trie.get(&hex!("6b657933cc")).is_some());
-
-        // Root is deterministic
-        let root = trie.root_hash();
-        assert_ne!(root, EMPTY_ROOT);
-    }
-
-    /// Test branch node creation
-    /// When two keys share a prefix but diverge, a branch is created
-    #[test]
-    fn test_branch_node_creation() {
-        let mut trie = MerkleTrie::new();
-
-        // Keys that will create a branch node
-        // "test" = 74 65 73 74
-        // "team" = 74 65 61 6d
-        // Both start with "te" (74 65) then diverge at 's' vs 'a'
-        trie.insert(b"test", b"value1".to_vec());
-        trie.insert(b"team", b"value2".to_vec());
-
-        assert_eq!(trie.get(b"test"), Some(b"value1".as_slice()));
-        assert_eq!(trie.get(b"team"), Some(b"value2".as_slice()));
-
-        // Adding a third key with same prefix
-        trie.insert(b"tear", b"value3".to_vec());
-        assert_eq!(trie.get(b"tear"), Some(b"value3".as_slice()));
-
-        // All still accessible
-        assert_eq!(trie.get(b"test"), Some(b"value1".as_slice()));
-        assert_eq!(trie.get(b"team"), Some(b"value2".as_slice()));
-    }
-
-    /// Test extension node with long shared prefix
-    #[test]
-    fn test_extension_node() {
-        let mut trie = MerkleTrie::new();
-
-        // Keys with long shared prefix
-        let key1 = hex!("000000000000000000000000000000000000000000000000000000000000000a");
-        let key2 = hex!("000000000000000000000000000000000000000000000000000000000000000b");
-
-        trie.insert(&key1, b"value_a".to_vec());
-        trie.insert(&key2, b"value_b".to_vec());
-
-        assert_eq!(trie.get(&key1), Some(b"value_a".as_slice()));
-        assert_eq!(trie.get(&key2), Some(b"value_b".as_slice()));
-
-        // Adding key with different prefix
-        let key3 = hex!("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
-        trie.insert(&key3, b"value_f".to_vec());
-
-        // All still accessible
-        assert_eq!(trie.get(&key1), Some(b"value_a".as_slice()));
-        assert_eq!(trie.get(&key2), Some(b"value_b".as_slice()));
-        assert_eq!(trie.get(&key3), Some(b"value_f".as_slice()));
+        assert_eq!(trie1.root_hash(), trie2.root_hash());
     }
 }

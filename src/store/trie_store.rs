@@ -408,10 +408,7 @@ impl StateTrie {
                 if key.len() == 32 {
                     let mut slot_hash = [0u8; 32];
                     slot_hash.copy_from_slice(key);
-                    let mut val = [0u8; 32];
-                    let len = value.len().min(32);
-                    val[32 - len..].copy_from_slice(&value[value.len() - len..]);
-                    Some((slot_hash, val))
+                    Some((slot_hash, rlp_decode_storage_value(value)))
                 } else {
                     None
                 }
@@ -424,6 +421,66 @@ impl Default for StateTrie {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// RLP-encodes a byte string (for storage trie values).
+///
+/// Ethereum stores storage values as `RLP(trim_leading_zeros(value))`.
+fn rlp_encode_bytes(bytes: &[u8]) -> Vec<u8> {
+    if bytes.is_empty() {
+        return vec![0x80];
+    }
+    if bytes.len() == 1 && bytes[0] < 0x80 {
+        return vec![bytes[0]];
+    }
+    if bytes.len() <= 55 {
+        let mut result = Vec::with_capacity(1 + bytes.len());
+        result.push(0x80 + bytes.len() as u8);
+        result.extend_from_slice(bytes);
+        return result;
+    }
+    // Long string (> 55 bytes) — unlikely for storage values
+    let len = bytes.len();
+    let len_bytes = len.to_be_bytes();
+    let first_nonzero = len_bytes.iter().position(|&b| b != 0).unwrap_or(7);
+    let len_of_len = 8 - first_nonzero;
+    let mut result = Vec::with_capacity(1 + len_of_len + len);
+    result.push(0xb7 + len_of_len as u8);
+    result.extend_from_slice(&len_bytes[first_nonzero..]);
+    result.extend_from_slice(bytes);
+    result
+}
+
+/// Decodes an RLP byte string back to raw bytes.
+///
+/// Returns the decoded bytes, right-padded into a [u8; 32].
+fn rlp_decode_storage_value(rlp: &[u8]) -> [u8; 32] {
+    let mut arr = [0u8; 32];
+    if rlp.is_empty() {
+        return arr;
+    }
+    let prefix = rlp[0];
+    let bytes = if prefix < 0x80 {
+        // Single byte
+        &rlp[0..1]
+    } else if prefix == 0x80 {
+        // Empty string (zero value)
+        return arr;
+    } else if prefix <= 0xb7 {
+        let len = (prefix - 0x80) as usize;
+        &rlp[1..1 + len]
+    } else {
+        let len_of_len = (prefix - 0xb7) as usize;
+        let mut len = 0usize;
+        for i in 0..len_of_len {
+            len = (len << 8) | rlp[1 + i] as usize;
+        }
+        &rlp[1 + len_of_len..1 + len_of_len + len]
+    };
+    let offset = 32usize.saturating_sub(bytes.len());
+    let copy_len = bytes.len().min(32);
+    arr[offset..offset + copy_len].copy_from_slice(&bytes[..copy_len]);
+    arr
 }
 
 /// Storage trie for a single account's storage.
@@ -448,14 +505,8 @@ impl StorageTrie {
     }
 
     /// Gets a storage value using a pre-hashed slot key.
-    /// Used by snap sync which already has hashed keys.
     pub fn get_by_hash(&self, slot_hash: &[u8; 32]) -> Option<[u8; 32]> {
-        self.trie.get(slot_hash).map(|v| {
-            let mut arr = [0u8; 32];
-            let len = v.len().min(32);
-            arr[32 - len..].copy_from_slice(&v[v.len() - len..]);
-            arr
-        })
+        self.trie.get(slot_hash).map(|v| rlp_decode_storage_value(&v))
     }
 
     /// Sets a storage value.
@@ -465,14 +516,14 @@ impl StorageTrie {
     }
 
     /// Sets a storage value using a pre-hashed slot key.
-    /// Used by snap sync which already has hashed keys.
     pub fn set_by_hash(&mut self, slot_hash: &[u8; 32], value: [u8; 32]) {
-        // RLP encode the value (strip leading zeros)
         let trimmed: Vec<u8> = value.iter().skip_while(|&&b| b == 0).copied().collect();
         if trimmed.is_empty() {
             self.trie.remove(slot_hash);
         } else {
-            self.trie.insert(slot_hash, trimmed);
+            // RLP-encode the trimmed value (Ethereum stores RLP(compact(value)) in storage tries)
+            let rlp_value = rlp_encode_bytes(&trimmed);
+            self.trie.insert(slot_hash, rlp_value);
         }
     }
 
@@ -489,7 +540,8 @@ impl StorageTrie {
             if trimmed.is_empty() {
                 None // Skip zero values (they're deletions)
             } else {
-                Some((slot_hash, trimmed))
+                let rlp_value = rlp_encode_bytes(&trimmed);
+                Some((slot_hash, rlp_value))
             }
         }).collect();
         self.trie.insert_batch_prehashed(trie_entries);
@@ -1360,5 +1412,50 @@ mod tests {
         assert_eq!(loaded.get(b"key1"), Some(b"value1".to_vec()));
         assert_eq!(loaded.get(b"key2"), Some(b"value2".to_vec()));
         assert_eq!(loaded.get(b"another_key"), Some(b"another_value".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod genesis_debug_tests {
+    use super::*;
+    use crate::merkle::EMPTY_ROOT;
+
+    #[test]
+    fn debug_single_account_encoding() {
+        // Test with a simple account (nonce=0, balance=0, empty storage, empty code)
+        let account = AccountData {
+            nonce: 0,
+            balance: [0u8; 32],
+            storage_root: EMPTY_ROOT,
+            code_hash: AccountData::EMPTY_CODE_HASH,
+        };
+
+        let encoded = account.encode();
+        eprintln!("Account RLP: {:02x?}", encoded);
+        eprintln!("Account RLP hex: {}", hex::encode(&encoded));
+
+        // Standard Ethereum RLP for empty account:
+        // [0x80, 0x80, 0xa0, ...storage_root..., 0xa0, ...code_hash...]
+        // List header for ~68 bytes content: 0xf8 0x44
+        // nonce=0: 0x80
+        // balance=0: 0x80
+        // storage_root (32 bytes): 0xa0 + 32 bytes
+        // code_hash (32 bytes): 0xa0 + 32 bytes
+    }
+
+    #[test]
+    fn debug_trie_root_single_account() {
+        let mut state = StateTrie::new();
+        let address = [0u8; 20]; // zero address
+        let account = AccountData {
+            nonce: 0,
+            balance: [0u8; 32],
+            storage_root: EMPTY_ROOT,
+            code_hash: AccountData::EMPTY_CODE_HASH,
+        };
+
+        state.set_account(&address, account);
+        let root = state.root_hash();
+        eprintln!("Root hash for single account: {}", hex::encode(root));
     }
 }
