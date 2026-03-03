@@ -150,6 +150,17 @@ impl Blockchain {
         storage.set_raw(slot_hash, rlp_encoded);
     }
 
+    /// Flushes all in-memory storage tries to free memory.
+    ///
+    /// Computes the storage root for each account's storage trie,
+    /// updates the account's storage_root field, and drops the storage data.
+    /// Must be called periodically during large state transfers to avoid OOM.
+    ///
+    /// Returns the number of storage tries flushed.
+    pub fn flush_storage_tries(&self) -> usize {
+        self.state_trie.write().unwrap().flush_storage_tries()
+    }
+
     /// Persists the current state trie to the database.
     ///
     /// Used by snap sync after populating the state trie to persist it to disk.
