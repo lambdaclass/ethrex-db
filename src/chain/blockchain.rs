@@ -338,26 +338,26 @@ impl Blockchain {
 
                 // Apply account changes to state trie
                 for (addr, account_opt) in block.account_changes() {
-                    // Convert H256 address to [u8; 20] (take last 20 bytes)
-                    let addr_bytes: [u8; 20] = addr.as_bytes()[12..32].try_into().unwrap();
+                    // Block keys are already keccak-hashed (32 bytes)
+                    let addr_hash: [u8; 32] = *addr.as_fixed_bytes();
 
                     match account_opt {
                         Some(account) => {
                             let account_data = account_to_data(account);
-                            state_trie.set_account(&addr_bytes, account_data);
+                            state_trie.set_account_by_hash(&addr_hash, account_data);
                         }
                         None => {
                             // For deletion, set to empty account
                             // (In a full implementation, we'd remove it from the trie)
-                            state_trie.set_account(&addr_bytes, AccountData::empty());
+                            state_trie.set_account_by_hash(&addr_hash, AccountData::empty());
                         }
                     }
                 }
 
                 // Apply storage changes to state trie
                 for (addr, slots) in block.storage_changes() {
-                    let addr_bytes: [u8; 20] = addr.as_bytes()[12..32].try_into().unwrap();
-                    let storage = state_trie.storage_trie(&addr_bytes);
+                    let addr_hash: [u8; 32] = *addr.as_fixed_bytes();
+                    let storage = state_trie.storage_trie_by_hash(&addr_hash);
 
                     for (key, value) in slots {
                         // H256 keys are already big-endian
@@ -490,20 +490,20 @@ impl Blockchain {
         let committed = blocks.get(block_hash)?;
 
         for (addr, account_opt) in committed.block.account_changes() {
-            let addr_bytes: [u8; 20] = addr.as_bytes()[12..32].try_into().unwrap();
+            let addr_hash: [u8; 32] = *addr.as_fixed_bytes();
             match account_opt {
                 Some(account) => {
-                    temp_state.set_account(&addr_bytes, account_to_data(account));
+                    temp_state.set_account_by_hash(&addr_hash, account_to_data(account));
                 }
                 None => {
-                    temp_state.set_account(&addr_bytes, AccountData::empty());
+                    temp_state.set_account_by_hash(&addr_hash, AccountData::empty());
                 }
             }
         }
 
         for (addr, slots) in committed.block.storage_changes() {
-            let addr_bytes: [u8; 20] = addr.as_bytes()[12..32].try_into().unwrap();
-            let storage = temp_state.storage_trie(&addr_bytes);
+            let addr_hash: [u8; 32] = *addr.as_fixed_bytes();
+            let storage = temp_state.storage_trie_by_hash(&addr_hash);
             for (key, value) in slots {
                 let slot: [u8; 32] = *key.as_fixed_bytes();
                 storage.set(&slot, value.to_big_endian());
