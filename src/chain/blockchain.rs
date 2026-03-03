@@ -336,8 +336,15 @@ impl Blockchain {
                 let blocks = self.blocks_by_hash.read().unwrap();
                 let block = &blocks.get(hash).unwrap().block;
 
+                let account_changes: Vec<_> = block.account_changes().collect();
+                let storage_changes: Vec<_> = block.storage_changes().collect();
+                eprintln!(
+                    "[ethrex-db finalize] block {:?}: {} account changes, {} storage changes",
+                    hash, account_changes.len(), storage_changes.len()
+                );
+
                 // Apply account changes to state trie
-                for (addr, account_opt) in block.account_changes() {
+                for (addr, account_opt) in account_changes {
                     // Block keys are already keccak-hashed (32 bytes)
                     let addr_hash: [u8; 32] = *addr.as_fixed_bytes();
 
@@ -355,7 +362,7 @@ impl Blockchain {
                 }
 
                 // Apply storage changes to state trie
-                for (addr, slots) in block.storage_changes() {
+                for (addr, slots) in storage_changes {
                     let addr_hash: [u8; 32] = *addr.as_fixed_bytes();
                     let storage = state_trie.storage_trie_by_hash(&addr_hash);
 
