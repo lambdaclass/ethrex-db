@@ -424,6 +424,95 @@ impl Blockchain {
         self.state_trie.write().unwrap().root_hash()
     }
 
+    /// Generates an account proof as RLP-encoded nodes from finalized state.
+    pub fn generate_account_proof(&self, address_hash: &[u8; 32]) -> Vec<Vec<u8>> {
+        self.state_trie.write().unwrap().generate_account_proof(address_hash)
+    }
+
+    /// Generates a storage proof as RLP-encoded nodes from finalized state.
+    ///
+    /// Returns None if the storage trie doesn't exist in memory.
+    pub fn generate_storage_proof(&self, address_hash: &[u8; 32], slot_hash: &[u8; 32]) -> Option<Vec<Vec<u8>>> {
+        self.state_trie.write().unwrap().generate_storage_proof(address_hash, slot_hash)
+    }
+
+    /// Returns the RLP-encoded account trie node at the given nibble path.
+    pub fn get_account_trie_node(&self, path: &[u8]) -> Option<Vec<u8>> {
+        self.state_trie.write().unwrap().get_account_trie_node(path)
+    }
+
+    /// Returns the RLP-encoded storage trie node at the given nibble path.
+    ///
+    /// Returns None if the storage trie doesn't exist in memory.
+    pub fn get_storage_trie_node(&self, address_hash: &[u8; 32], path: &[u8]) -> Option<Vec<u8>> {
+        self.state_trie.write().unwrap().get_storage_trie_node(address_hash, path)
+    }
+
+    /// Iterates over all accounts in finalized state.
+    pub fn iter_finalized_accounts(&self) -> Vec<([u8; 32], AccountData)> {
+        self.state_trie.read().unwrap().iter_accounts()
+    }
+
+    /// Iterates over all storage slots for an account in finalized state.
+    ///
+    /// Returns None if the storage trie doesn't exist in memory.
+    pub fn iter_finalized_storage(&self, address_hash: &[u8; 32]) -> Option<Vec<([u8; 32], [u8; 32])>> {
+        self.state_trie.read().unwrap().iter_storage(address_hash)
+    }
+
+    /// Computes the state root for a specific committed block.
+    ///
+    /// This builds a temporary state trie from the finalized state plus the
+    /// block's changes and computes the root hash. Returns None if the block
+    /// is not found.
+    pub fn state_root_for_block(&self, block_hash: &H256) -> Option<[u8; 32]> {
+        use crate::store::StateTrie;
+
+        // First check the block exists
+        {
+            let blocks = self.blocks_by_hash.read().unwrap();
+            if !blocks.contains_key(block_hash) {
+                return None;
+            }
+        }
+
+        // Get finalized accounts
+        let finalized_accounts = self.state_trie.read().unwrap().iter_accounts();
+
+        // Build temporary state trie from finalized data
+        let mut temp_state = StateTrie::new();
+        for (addr_hash, account_data) in finalized_accounts {
+            temp_state.set_account_by_hash(&addr_hash, account_data);
+        }
+
+        // Apply block changes
+        let blocks = self.blocks_by_hash.read().unwrap();
+        let committed = blocks.get(block_hash)?;
+
+        for (addr, account_opt) in committed.block.account_changes() {
+            let addr_bytes: [u8; 20] = addr.as_bytes()[12..32].try_into().unwrap();
+            match account_opt {
+                Some(account) => {
+                    temp_state.set_account(&addr_bytes, account_to_data(account));
+                }
+                None => {
+                    temp_state.set_account(&addr_bytes, AccountData::empty());
+                }
+            }
+        }
+
+        for (addr, slots) in committed.block.storage_changes() {
+            let addr_bytes: [u8; 20] = addr.as_bytes()[12..32].try_into().unwrap();
+            let storage = temp_state.storage_trie(&addr_bytes);
+            for (key, value) in slots {
+                let slot: [u8; 32] = *key.as_fixed_bytes();
+                storage.set(&slot, value.to_big_endian());
+            }
+        }
+
+        Some(temp_state.root_hash())
+    }
+
     /// Gets an account from finalized state.
     pub fn get_finalized_account(&self, address: &[u8; 20]) -> Option<Account> {
         let trie = self.state_trie.read().unwrap();

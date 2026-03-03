@@ -40,9 +40,17 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
+# Trie comparison benchmark dependencies
+ethrex-trie = { git = "https://github.com/lambdaclass/ethrex", branch = "main" }
+cita_trie = "5.0"
+hasher = { version = "0.1", features = ["hash-keccak"] }
 
 [[bench]]
 name = "benchmarks"
+harness = false
+
+[[bench]]
+name = "trie_comparison"
 harness = false
 
 [[example]]

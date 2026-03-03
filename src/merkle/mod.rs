@@ -12,6 +12,6 @@ mod bloom;
 mod tests;
 
 pub use node::{Node, NodeType, ChildRef, keccak256, EMPTY_ROOT, HASH_SIZE};
-pub use trie::{MerkleTrie, TrieError};
+pub use trie::{MerkleTrie, MerkleProof, ProofNode, TrieError};
 pub use rlp_encode::RlpEncoder;
 pub use bloom::BloomFilter;

@@ -171,6 +171,16 @@ impl PersistentTrie {
         self.trie.iter()
     }
 
+    /// Generates a Merkle proof for the given key.
+    pub fn generate_proof(&mut self, key: &[u8]) -> crate::merkle::MerkleProof {
+        self.trie.generate_proof(key)
+    }
+
+    /// Returns the RLP-encoded node at the given nibble path.
+    pub fn get_node_rlp_at_path(&mut self, path_nibbles: &[u8]) -> Option<Vec<u8>> {
+        self.trie.get_node_rlp_at_path(path_nibbles)
+    }
+
     /// Clears pending changes after commit.
     pub fn clear_pending(&mut self) {
         self.pending.clear();
@@ -344,6 +354,69 @@ impl StateTrie {
                 self.trie.insert(address_hash, account.encode());
             }
         }
+    }
+
+    /// Generates an account proof as RLP-encoded nodes.
+    pub fn generate_account_proof(&mut self, address_hash: &[u8; 32]) -> Vec<Vec<u8>> {
+        let proof = self.trie.generate_proof(address_hash);
+        proof.to_rlp_nodes()
+    }
+
+    /// Generates a storage proof as RLP-encoded nodes.
+    ///
+    /// Returns None if the storage trie doesn't exist in memory (e.g., after flush).
+    pub fn generate_storage_proof(&mut self, address_hash: &[u8; 32], slot_hash: &[u8; 32]) -> Option<Vec<Vec<u8>>> {
+        let storage = self.storage_tries.get_mut(address_hash)?;
+        let proof = storage.trie.generate_proof(slot_hash);
+        Some(proof.to_rlp_nodes())
+    }
+
+    /// Returns the RLP-encoded account trie node at the given nibble path.
+    pub fn get_account_trie_node(&mut self, path: &[u8]) -> Option<Vec<u8>> {
+        self.trie.get_node_rlp_at_path(path)
+    }
+
+    /// Returns the RLP-encoded storage trie node at the given nibble path.
+    ///
+    /// Returns None if the storage trie doesn't exist in memory.
+    pub fn get_storage_trie_node(&mut self, address_hash: &[u8; 32], path: &[u8]) -> Option<Vec<u8>> {
+        self.storage_tries.get_mut(address_hash)?.trie.get_node_rlp_at_path(path)
+    }
+
+    /// Iterates over all accounts in the state trie.
+    pub fn iter_accounts(&self) -> Vec<([u8; 32], AccountData)> {
+        self.trie.iter()
+            .filter_map(|(key, value)| {
+                if key.len() == 32 {
+                    let mut addr_hash = [0u8; 32];
+                    addr_hash.copy_from_slice(key);
+                    Some((addr_hash, AccountData::decode(value)))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Iterates over all storage slots for an account.
+    ///
+    /// Returns None if the storage trie doesn't exist in memory.
+    pub fn iter_storage(&self, address_hash: &[u8; 32]) -> Option<Vec<([u8; 32], [u8; 32])>> {
+        let storage = self.storage_tries.get(address_hash)?;
+        Some(storage.trie.iter()
+            .filter_map(|(key, value)| {
+                if key.len() == 32 {
+                    let mut slot_hash = [0u8; 32];
+                    slot_hash.copy_from_slice(key);
+                    let mut val = [0u8; 32];
+                    let len = value.len().min(32);
+                    val[32 - len..].copy_from_slice(&value[value.len() - len..]);
+                    Some((slot_hash, val))
+                } else {
+                    None
+                }
+            })
+            .collect())
     }
 }
 
@@ -1020,6 +1093,42 @@ impl PagedStateTrie {
     /// that had no storage returned during healing.
     pub fn update_account_storage_root(&mut self, address_hash: &[u8; 32], storage_root: [u8; 32]) {
         self.state.update_account_storage_root(address_hash, storage_root);
+    }
+
+    /// Generates an account proof as RLP-encoded nodes.
+    pub fn generate_account_proof(&mut self, address_hash: &[u8; 32]) -> Vec<Vec<u8>> {
+        self.state.generate_account_proof(address_hash)
+    }
+
+    /// Generates a storage proof as RLP-encoded nodes.
+    ///
+    /// Returns None if the storage trie doesn't exist in memory.
+    pub fn generate_storage_proof(&mut self, address_hash: &[u8; 32], slot_hash: &[u8; 32]) -> Option<Vec<Vec<u8>>> {
+        self.state.generate_storage_proof(address_hash, slot_hash)
+    }
+
+    /// Returns the RLP-encoded account trie node at the given nibble path.
+    pub fn get_account_trie_node(&mut self, path: &[u8]) -> Option<Vec<u8>> {
+        self.state.get_account_trie_node(path)
+    }
+
+    /// Returns the RLP-encoded storage trie node at the given nibble path.
+    ///
+    /// Returns None if the storage trie doesn't exist in memory.
+    pub fn get_storage_trie_node(&mut self, address_hash: &[u8; 32], path: &[u8]) -> Option<Vec<u8>> {
+        self.state.get_storage_trie_node(address_hash, path)
+    }
+
+    /// Iterates over all accounts in the state trie.
+    pub fn iter_accounts(&self) -> Vec<([u8; 32], AccountData)> {
+        self.state.iter_accounts()
+    }
+
+    /// Iterates over all storage slots for an account.
+    ///
+    /// Returns None if the storage trie doesn't exist in memory.
+    pub fn iter_storage(&self, address_hash: &[u8; 32]) -> Option<Vec<([u8; 32], [u8; 32])>> {
+        self.state.iter_storage(address_hash)
     }
 }
 

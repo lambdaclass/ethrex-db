@@ -693,6 +693,84 @@ impl MerkleTrie {
     }
 }
 
+impl MerkleTrie {
+    /// Given a path of nibbles, traverse the trie and return the RLP-encoded node at that path.
+    ///
+    /// The path represents the sequence of nibbles to follow from the root.
+    /// Returns None if the trie is empty or the path doesn't lead to a valid node.
+    pub fn get_node_rlp_at_path(&mut self, path_nibbles: &[u8]) -> Option<Vec<u8>> {
+        if self.data.is_empty() {
+            return None;
+        }
+
+        let mut entries: Vec<(Vec<u8>, &[u8])> = self.data
+            .iter()
+            .map(|(k, v)| (key_to_nibbles(k), v.as_slice()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        self.find_node_at_path(&entries, 0, path_nibbles)
+    }
+
+    fn find_node_at_path(
+        &self,
+        entries: &[(Vec<u8>, &[u8])],
+        depth: usize,
+        target_path: &[u8],
+    ) -> Option<Vec<u8>> {
+        if entries.is_empty() {
+            return None;
+        }
+
+        // If we've consumed the entire target path, return the node at this position.
+        if depth >= target_path.len() {
+            let node = self.build_node(entries, depth);
+            return Some(node.encode());
+        }
+
+        if entries.len() == 1 {
+            // Leaf node - we're at the end, return it.
+            let node = self.build_node(entries, depth);
+            return Some(node.encode());
+        }
+
+        let common_prefix = self.find_common_prefix(entries, depth);
+
+        if common_prefix > 0 {
+            let prefix: Vec<u8> = entries[0].0[depth..depth + common_prefix].to_vec();
+            let remaining_target = &target_path[depth..];
+
+            if remaining_target.starts_with(&prefix) {
+                // Target path goes through this extension - recurse into child
+                self.find_node_at_path(entries, depth + common_prefix, target_path)
+            } else {
+                // Target path matches partially or not at all - return the extension node
+                let node = self.build_node(entries, depth);
+                Some(node.encode())
+            }
+        } else {
+            // Branch node
+            let target_nibble = target_path[depth] as usize;
+
+            let mut groups: [Vec<(Vec<u8>, &[u8])>; 16] = Default::default();
+            for (nibbles, value) in entries {
+                if depth < nibbles.len() {
+                    let nibble = nibbles[depth] as usize;
+                    groups[nibble].push((nibbles.clone(), *value));
+                }
+            }
+
+            if !groups[target_nibble].is_empty() {
+                self.find_node_at_path(&groups[target_nibble], depth + 1, target_path)
+            } else {
+                // Target nibble has no children - return the branch node itself
+                let node = self.build_node(entries, depth);
+                Some(node.encode())
+            }
+        }
+    }
+}
+
 impl Default for MerkleTrie {
     fn default() -> Self {
         Self::new()
@@ -907,6 +985,47 @@ impl MerkleTrie {
 }
 
 impl MerkleProof {
+    /// Converts each proof node to its RLP-encoded bytes (Ethereum standard proof format).
+    ///
+    /// Returns a list of RLP-encoded nodes from root to target key, suitable
+    /// for use in eth_getProof responses and proof verification.
+    pub fn to_rlp_nodes(&self) -> Vec<Vec<u8>> {
+        use super::rlp_encode::RlpEncoder;
+
+        self.proof.iter().map(|node| {
+            let mut enc = RlpEncoder::new();
+            match node {
+                ProofNode::Branch { children, value } => {
+                    enc.encode_list(|e| {
+                        for child in children.iter() {
+                            match child {
+                                Some(hash) => e.encode_bytes(hash),
+                                None => e.encode_empty(),
+                            }
+                        }
+                        match value {
+                            Some(v) => e.encode_bytes(v),
+                            None => e.encode_empty(),
+                        }
+                    });
+                }
+                ProofNode::Extension { path, child } => {
+                    enc.encode_list(|e| {
+                        e.encode_nibbles(path, false);
+                        e.encode_bytes(child);
+                    });
+                }
+                ProofNode::Leaf { path, value } => {
+                    enc.encode_list(|e| {
+                        e.encode_nibbles(path, true);
+                        e.encode_bytes(value);
+                    });
+                }
+            }
+            enc.into_bytes()
+        }).collect()
+    }
+
     /// Verifies this proof against a given root hash.
     ///
     /// Returns true if the proof is valid for the given root.
