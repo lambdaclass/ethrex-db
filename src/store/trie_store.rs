@@ -946,15 +946,6 @@ impl PagedStateTrie {
             return Ok(DbAddress::NULL);
         }
 
-        let total_data: usize = entries.iter().map(|(k, v)| k.len() + v.len()).sum();
-        eprintln!(
-            "PagedStateTrie::save: {} entries, total data = {} bytes ({:.1} MB), avg entry = {} bytes",
-            entries.len(),
-            total_data,
-            total_data as f64 / 1_048_576.0,
-            total_data / entries.len().max(1),
-        );
-
         let addr = Self::save_recursive(batch, &entries, 0)?;
         self.root_addr = Some(addr);
         Ok(addr)
@@ -1485,8 +1476,6 @@ mod genesis_debug_tests {
         };
 
         let encoded = account.encode();
-        eprintln!("Account RLP: {:02x?}", encoded);
-        eprintln!("Account RLP hex: {}", hex::encode(&encoded));
 
         // Standard Ethereum RLP for empty account:
         // [0x80, 0x80, 0xa0, ...storage_root..., 0xa0, ...code_hash...]

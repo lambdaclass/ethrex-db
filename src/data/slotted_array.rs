@@ -13,6 +13,11 @@ use super::NibblePath;
 /// Fixed page size in bytes (4KB).
 pub const PAGE_SIZE: usize = 4096;
 
+/// Usable data area within a page. When stored on disk, pages have an 8-byte
+/// PageHeader that reduces the payload to 4088 bytes. Data must not extend
+/// beyond this offset or it will be truncated during save/load.
+const USABLE_SIZE: usize = PAGE_SIZE - 8;
+
 /// Header size at the start of the slotted array.
 const HEADER_SIZE: usize = 8;
 
@@ -28,7 +33,8 @@ const SLOT_SIZE: usize = 4;
 ///
 /// - Header: tracks slot count and data pointer
 /// - Slots grow forward from after header
-/// - Data grows backward from end of page
+/// - Data grows backward from USABLE_SIZE (4088), not PAGE_SIZE (4096),
+///   to fit within the page payload after the 8-byte PageHeader
 pub struct SlottedArray {
     data: [u8; PAGE_SIZE],
 }
@@ -39,7 +45,7 @@ pub struct SlottedArray {
 struct Header {
     /// Number of slots (including deleted)
     slot_count: u16,
-    /// Offset where data region starts (grows downward from PAGE_SIZE)
+    /// Offset where data region starts (grows downward from USABLE_SIZE)
     data_start: u16,
     /// Address of the next leaf page in a chain (0 = no next page).
     /// Used by PagedStateTrie to chain multiple leaf pages together
@@ -65,7 +71,7 @@ impl SlottedArray {
         };
         arr.set_header(Header {
             slot_count: 0,
-            data_start: PAGE_SIZE as u16,
+            data_start: USABLE_SIZE as u16,
             next_page: 0,
         });
         arr
@@ -736,5 +742,30 @@ mod tests {
 
         // After defrag: 5 slots, 5 live = no defrag needed
         assert!(!arr.needs_defragmentation());
+    }
+
+    #[test]
+    fn test_roundtrip_through_truncated_buffer() {
+        // Simulate the page save/load cycle where only 4088 of 4096 bytes survive.
+        // This is the exact scenario that caused code hash truncation in production.
+        let mut arr = SlottedArray::new();
+        let key = NibblePath::from_bytes(&[0xAB, 0xCD]);
+        // Use a 32-byte value similar to an Ethereum code hash
+        let value: Vec<u8> = (0..32).collect();
+
+        assert!(arr.try_insert(&key, &value));
+
+        // Simulate save: copy only first 4088 bytes (page payload size)
+        let bytes = arr.as_bytes();
+        let truncated: Vec<u8> = bytes[..4088].to_vec();
+
+        // Simulate load: put into a 4096-byte array with trailing zeros
+        let mut loaded = [0u8; PAGE_SIZE];
+        loaded[..4088].copy_from_slice(&truncated);
+        let loaded_arr = SlottedArray::from_bytes(loaded);
+
+        // Value must survive the roundtrip intact
+        let retrieved = loaded_arr.get(&key).expect("key should be found");
+        assert_eq!(retrieved, value, "value was corrupted during save/load roundtrip");
     }
 }
