@@ -868,3 +868,102 @@ fn test_e2e_state_persist_and_reload_with_fanout() {
     }
     assert_eq!(found, account_count as usize);
 }
+
+#[test]
+fn test_e2e_chained_leaf_pages() {
+    // Test that the chained leaf optimization works correctly.
+    // 5000 accounts with keccak-hashed keys distributed across 256 depth-0 buckets
+    // means ~20 entries per bucket → fits in 1 leaf per bucket (no chains at depth 1).
+    // But this validates the overall save/load roundtrip with a moderate dataset.
+    use ethrex_db::store::{PagedStateTrie, AccountData};
+
+    let mut db = PagedDb::in_memory(100_000).unwrap();
+
+    let mut trie = PagedStateTrie::new();
+    let account_count = 5000;
+    let mut expected: Vec<([u8; 32], u64, [u8; 32])> = Vec::new();
+
+    for i in 0u64..account_count {
+        let addr_hash = keccak256(&i.to_be_bytes());
+        let mut balance = [0u8; 32];
+        balance[24..32].copy_from_slice(&(i * 1000 + 42).to_be_bytes());
+        let account = AccountData {
+            nonce: i,
+            balance,
+            storage_root: [0u8; 32],
+            code_hash: AccountData::EMPTY_CODE_HASH,
+        };
+        trie.set_account_by_hash(&addr_hash, account);
+        expected.push((addr_hash, i, balance));
+    }
+
+    // Persist
+    {
+        let mut batch = db.begin_batch();
+        let root_addr = trie.save(&mut batch).unwrap();
+        assert!(!root_addr.is_null());
+        batch.set_state_root(root_addr);
+        batch.set_metadata(1, &[0xBB; 32]);
+        batch.commit(CommitOptions::DangerNoFlush).unwrap();
+    }
+
+    // Reload
+    let state_root = db.begin_read_only().state_root();
+    assert!(!state_root.is_null());
+    let loaded = PagedStateTrie::load(&db, state_root).unwrap();
+
+    // Verify every account roundtrips
+    for (addr_hash, expected_nonce, expected_balance) in &expected {
+        let account = loaded.get_account_by_hash(addr_hash)
+            .unwrap_or_else(|| panic!("Account nonce={} missing after reload", expected_nonce));
+        assert_eq!(account.nonce, *expected_nonce);
+        assert_eq!(account.balance, *expected_balance);
+    }
+}
+
+#[test]
+fn test_e2e_large_chained_leaf_roundtrip() {
+    // Test with 50K accounts that guarantees chained leaves.
+    // 50K / 256 depth-0 buckets ≈ 195 entries per bucket.
+    // Each entry ≈ 134 bytes, so ~30 per leaf page → ~7 pages per bucket.
+    // This exercises the chained leaf save/load path.
+    use ethrex_db::store::{PagedStateTrie, AccountData};
+
+    let mut db = PagedDb::in_memory(500_000).unwrap();
+    let mut trie = PagedStateTrie::new();
+    let account_count: u64 = 50_000;
+    let mut expected_hashes: Vec<[u8; 32]> = Vec::new();
+
+    for i in 0..account_count {
+        let addr_hash = keccak256(&i.to_be_bytes());
+        let mut balance = [0u8; 32];
+        balance[24..32].copy_from_slice(&(i * 7 + 1).to_be_bytes());
+        let account = AccountData {
+            nonce: i,
+            balance,
+            storage_root: [0u8; 32],
+            code_hash: AccountData::EMPTY_CODE_HASH,
+        };
+        trie.set_account_by_hash(&addr_hash, account);
+        expected_hashes.push(addr_hash);
+    }
+
+    // Save and reload
+    {
+        let mut batch = db.begin_batch();
+        let root_addr = trie.save(&mut batch).unwrap();
+        batch.set_state_root(root_addr);
+        batch.set_metadata(1, &[0xCC; 32]);
+        batch.commit(CommitOptions::DangerNoFlush).unwrap();
+    }
+
+    let state_root = db.begin_read_only().state_root();
+    let loaded = PagedStateTrie::load(&db, state_root).unwrap();
+
+    // Verify all accounts survive the roundtrip
+    for (i, addr_hash) in expected_hashes.iter().enumerate() {
+        let account = loaded.get_account_by_hash(addr_hash)
+            .unwrap_or_else(|| panic!("Account {} (i={}) missing", hex::encode(addr_hash), i));
+        assert_eq!(account.nonce, i as u64);
+    }
+}

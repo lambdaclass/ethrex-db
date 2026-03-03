@@ -41,8 +41,10 @@ struct Header {
     slot_count: u16,
     /// Offset where data region starts (grows downward from PAGE_SIZE)
     data_start: u16,
-    /// Reserved for future use
-    _reserved: u32,
+    /// Address of the next leaf page in a chain (0 = no next page).
+    /// Used by PagedStateTrie to chain multiple leaf pages together
+    /// when entries don't fit in a single page.
+    next_page: u32,
 }
 
 /// A slot entry pointing to stored data.
@@ -64,7 +66,7 @@ impl SlottedArray {
         arr.set_header(Header {
             slot_count: 0,
             data_start: PAGE_SIZE as u16,
-            _reserved: 0,
+            next_page: 0,
         });
         arr
     }
@@ -82,6 +84,18 @@ impl SlottedArray {
     /// Returns the number of entries (including tombstones).
     pub fn slot_count(&self) -> usize {
         self.header().slot_count as usize
+    }
+
+    /// Returns the next page address in a leaf chain (0 = no next page).
+    pub fn next_page_addr(&self) -> u32 {
+        self.header().next_page
+    }
+
+    /// Sets the next page address for leaf chaining.
+    pub fn set_next_page_addr(&mut self, addr: u32) {
+        let mut header = self.header();
+        header.next_page = addr;
+        self.set_header(header);
     }
 
     /// Returns the amount of free space available.

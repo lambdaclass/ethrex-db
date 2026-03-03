@@ -772,21 +772,13 @@ impl PagedStateTrie {
 
         match page_type {
             Some(PageType::Leaf) => {
-                // Simple case: all data in a single leaf page
-                let leaf = LeafPage::wrap(root_page);
-                let arr = SlottedArray::from_bytes(Self::payload_to_array(leaf.data()));
-
-                for (path, value) in arr.iter() {
-                    let key = PersistentTrie::nibble_path_to_bytes(&path);
-                    // Decode as account data
-                    let _account = AccountData::decode(&value);
-                    // Convert key back to address (it's keccak256 of address, but we store the hash)
+                // Leaf at root — may be a single page or a chain
+                Self::load_leaf_chain(db, &root_page, |remaining, value| {
                     let mut addr_hash = [0u8; 32];
-                    let copy_len = key.len().min(32);
-                    addr_hash[..copy_len].copy_from_slice(&key[..copy_len]);
-                    // Insert directly into the underlying trie
+                    let copy_len = remaining.len().min(32);
+                    addr_hash[..copy_len].copy_from_slice(&remaining[..copy_len]);
                     state.trie.insert(&addr_hash, value);
-                }
+                })?;
             }
             Some(PageType::Data) => {
                 // Complex case: fanout structure
@@ -805,6 +797,41 @@ impl PagedStateTrie {
             state,
             root_addr: Some(root_addr),
         })
+    }
+
+    /// Loads entries from a leaf page, following the chain if present.
+    ///
+    /// For each entry, calls `insert_fn(suffix_bytes, value)` where suffix_bytes
+    /// are the key bytes remaining after the prefix has been stripped during save.
+    fn load_leaf_chain<F>(db: &PagedDb, first_page: &crate::store::Page, mut insert_fn: F) -> Result<(), DbError>
+    where
+        F: FnMut(&[u8], Vec<u8>),
+    {
+        // Load first page
+        let leaf = LeafPage::wrap(first_page.clone());
+        let arr = SlottedArray::from_bytes(Self::payload_to_array(leaf.data()));
+
+        for (path, value) in arr.iter() {
+            let remaining = PersistentTrie::nibble_path_to_bytes(&path);
+            insert_fn(&remaining, value);
+        }
+
+        // Follow chain
+        let mut next = arr.next_page_addr();
+        while next != 0 {
+            let next_page = db.get_page(DbAddress::page(next))?;
+            let leaf = LeafPage::wrap(next_page);
+            let arr = SlottedArray::from_bytes(Self::payload_to_array(leaf.data()));
+
+            for (path, value) in arr.iter() {
+                let remaining = PersistentTrie::nibble_path_to_bytes(&path);
+                insert_fn(&remaining, value);
+            }
+
+            next = arr.next_page_addr();
+        }
+
+        Ok(())
     }
 
     fn load_from_data_page(db: &PagedDb, page: &crate::store::Page, state: &mut StateTrie) -> Result<(), DbError> {
@@ -830,11 +857,7 @@ impl PagedStateTrie {
 
                 match child_type {
                     Some(PageType::Leaf) => {
-                        let leaf = LeafPage::wrap(child_page);
-                        let arr = SlottedArray::from_bytes(Self::payload_to_array(leaf.data()));
-
-                        for (path, value) in arr.iter() {
-                            let remaining = PersistentTrie::nibble_path_to_bytes(&path);
+                        Self::load_leaf_chain(db, &child_page, |remaining, value| {
                             let mut addr_hash = [0u8; 32];
                             let prefix_len = full_prefix.len().min(32);
                             addr_hash[..prefix_len].copy_from_slice(&full_prefix[..prefix_len]);
@@ -842,7 +865,7 @@ impl PagedStateTrie {
                             addr_hash[prefix_len..prefix_len + remaining_len]
                                 .copy_from_slice(&remaining[..remaining_len]);
                             state.trie.insert(&addr_hash, value);
-                        }
+                        })?;
                     }
                     Some(PageType::Data) => {
                         // Recursive fanout — pass accumulated prefix
@@ -874,16 +897,12 @@ impl PagedStateTrie {
 
             match page_type {
                 Some(PageType::Leaf) => {
-                    let leaf = LeafPage::wrap(accounts_page);
-                    let arr = SlottedArray::from_bytes(Self::payload_to_array(leaf.data()));
-
-                    for (path, value) in arr.iter() {
-                        let key = PersistentTrie::nibble_path_to_bytes(&path);
+                    Self::load_leaf_chain(db, &accounts_page, |remaining, value| {
                         let mut addr_hash = [0u8; 32];
-                        let copy_len = key.len().min(32);
-                        addr_hash[..copy_len].copy_from_slice(&key[..copy_len]);
+                        let copy_len = remaining.len().min(32);
+                        addr_hash[..copy_len].copy_from_slice(&remaining[..copy_len]);
                         state.trie.insert(&addr_hash, value);
-                    }
+                    })?;
                 }
                 Some(PageType::Data) => {
                     Self::load_from_data_page(db, &accounts_page, state)?;
@@ -927,16 +946,30 @@ impl PagedStateTrie {
             return Ok(DbAddress::NULL);
         }
 
+        let total_data: usize = entries.iter().map(|(k, v)| k.len() + v.len()).sum();
+        eprintln!(
+            "PagedStateTrie::save: {} entries, total data = {} bytes ({:.1} MB), avg entry = {} bytes",
+            entries.len(),
+            total_data,
+            total_data as f64 / 1_048_576.0,
+            total_data / entries.len().max(1),
+        );
+
         let addr = Self::save_recursive(batch, &entries, 0)?;
         self.root_addr = Some(addr);
         Ok(addr)
     }
 
+    /// Maximum leaf pages in a chain before we prefer fanout.
+    /// With ~30 entries per page, 64 pages ≈ 1920 entries.
+    const MAX_CHAIN_PAGES: usize = 64;
+
     /// Recursively saves entries using fanout by key byte at `depth`.
     ///
-    /// If all entries fit in a single leaf page, creates a leaf.
-    /// Otherwise, creates a DataPage with 256 buckets keyed by the byte
-    /// at position `depth`, and recurses for each bucket at `depth + 1`.
+    /// Strategy (cheapest first):
+    /// 1. If all entries fit in a single leaf page → single leaf.
+    /// 2. If entries fit in <= MAX_CHAIN_PAGES leaf pages → chained leaves.
+    /// 3. Otherwise → DataPage with 256 buckets, recurse at depth+1.
     fn save_recursive(batch: &mut BatchContext, entries: &[(Vec<u8>, Vec<u8>)], depth: usize) -> Result<DbAddress, DbError> {
         if entries.is_empty() {
             return Ok(DbAddress::NULL);
@@ -957,17 +990,18 @@ impl PagedStateTrie {
         }
 
         if all_fit {
-            let (addr, _) = batch.allocate_page(PageType::Leaf, depth as u8)?;
-            let arr_bytes = arr.as_bytes();
-            let mut leaf_page = batch.get_writable_copy(addr)?;
-            let payload = leaf_page.payload_mut();
-            let copy_len = payload.len().min(arr_bytes.len());
-            payload[..copy_len].copy_from_slice(&arr_bytes[..copy_len]);
-            batch.mark_dirty(addr, leaf_page);
-            return Ok(addr);
+            return Self::write_leaf(batch, &arr, depth);
         }
 
-        // Doesn't fit — fanout by the byte at `depth`
+        // Try chained leaves: pack entries into multiple linked leaf pages.
+        // This is much more space-efficient than fanout when the entry count
+        // is moderate (e.g., 360 entries at depth 2 need ~12 pages vs 190+
+        // pages from a mostly-empty 256-way fanout).
+        if let Some(first_addr) = Self::try_save_as_chain(batch, entries, depth)? {
+            return Ok(first_addr);
+        }
+
+        // Doesn't fit in a chain — fanout by the byte at `depth`
         let mut buckets: Vec<Vec<(Vec<u8>, Vec<u8>)>> = (0..256).map(|_| Vec::new()).collect();
 
         for (key, value) in entries {
@@ -990,6 +1024,86 @@ impl PagedStateTrie {
 
         batch.mark_dirty(addr, data_page.into_page());
         Ok(addr)
+    }
+
+    /// Writes a single leaf page from a filled SlottedArray.
+    fn write_leaf(batch: &mut BatchContext, arr: &SlottedArray, depth: usize) -> Result<DbAddress, DbError> {
+        let (addr, _) = batch.allocate_page(PageType::Leaf, depth as u8)?;
+        let arr_bytes = arr.as_bytes();
+        let mut leaf_page = batch.get_writable_copy(addr)?;
+        let payload = leaf_page.payload_mut();
+        let copy_len = payload.len().min(arr_bytes.len());
+        payload[..copy_len].copy_from_slice(&arr_bytes[..copy_len]);
+        batch.mark_dirty(addr, leaf_page);
+        Ok(addr)
+    }
+
+    /// Tries to save entries as a chain of linked leaf pages.
+    ///
+    /// Returns `Some(first_page_addr)` if entries fit in <= MAX_CHAIN_PAGES pages,
+    /// or `None` if too many pages would be needed (caller should fanout instead).
+    fn try_save_as_chain(
+        batch: &mut BatchContext,
+        entries: &[(Vec<u8>, Vec<u8>)],
+        depth: usize,
+    ) -> Result<Option<DbAddress>, DbError> {
+        // Build all the SlottedArrays first to check if we stay within the limit.
+        let mut pages: Vec<SlottedArray> = Vec::new();
+        let mut current = SlottedArray::new();
+
+        for (key, value) in entries {
+            let suffix = if key.len() > depth { &key[depth..] } else { &[] };
+            let path = NibblePath::from_bytes(suffix);
+
+            if !current.try_insert(&path, value) {
+                // Current page is full, start a new one
+                pages.push(current);
+                if pages.len() >= Self::MAX_CHAIN_PAGES {
+                    // Too many pages — bail out, let caller fanout
+                    return Ok(None);
+                }
+                current = SlottedArray::new();
+                // Insert into the fresh page (must succeed for reasonable entry sizes)
+                if !current.try_insert(&path, value) {
+                    // Single entry doesn't fit in a page — shouldn't happen with 4KB pages
+                    return Err(DbError::Corrupted);
+                }
+            }
+        }
+        // Don't forget the last page
+        pages.push(current);
+
+        if pages.len() > Self::MAX_CHAIN_PAGES {
+            return Ok(None);
+        }
+
+        // Allocate all pages and link them in reverse order so each page
+        // knows its successor's address.
+        let mut next_addr = DbAddress::NULL;
+        let mut first_addr = DbAddress::NULL;
+
+        for (i, arr) in pages.iter().enumerate().rev() {
+            let (addr, _) = batch.allocate_page(PageType::Leaf, depth as u8)?;
+
+            let mut arr_copy = SlottedArray::from_bytes(*arr.as_bytes());
+            if !next_addr.is_null() {
+                arr_copy.set_next_page_addr(next_addr.raw());
+            }
+
+            let mut leaf_page = batch.get_writable_copy(addr)?;
+            let payload = leaf_page.payload_mut();
+            let arr_bytes = arr_copy.as_bytes();
+            let copy_len = payload.len().min(arr_bytes.len());
+            payload[..copy_len].copy_from_slice(&arr_bytes[..copy_len]);
+            batch.mark_dirty(addr, leaf_page);
+
+            next_addr = addr;
+            if i == 0 {
+                first_addr = addr;
+            }
+        }
+
+        Ok(Some(first_addr))
     }
 
     /// Gets an account by address.
